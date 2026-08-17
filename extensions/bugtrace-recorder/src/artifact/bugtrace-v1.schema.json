@@ -1,0 +1,561 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.juner.dev/bugtrace/bugtrace-v1.schema.json",
+  "title": "Bugtrace semantic browser reproduction trace v1",
+  "description": "Agent-oriented semantic reproduction data. rrweb and screenshots are supporting evidence, not the normative action stream.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "formatVersion",
+    "generator",
+    "session",
+    "environment",
+    "privacy",
+    "coverage",
+    "tabs",
+    "steps",
+    "navigations",
+    "console",
+    "network",
+    "errors",
+    "screenshots",
+    "rrweb",
+    "captureGaps",
+    "attachments"
+  ],
+  "properties": {
+    "format": { "const": "bugtrace" },
+    "formatVersion": { "const": "1.0.0" },
+    "generator": { "$ref": "#/$defs/generator" },
+    "session": { "$ref": "#/$defs/session" },
+    "environment": { "$ref": "#/$defs/environment" },
+    "privacy": { "$ref": "#/$defs/privacy" },
+    "coverage": { "$ref": "#/$defs/coverage" },
+    "tabs": { "type": "array", "items": { "$ref": "#/$defs/tab" } },
+    "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } },
+    "navigations": { "type": "array", "items": { "$ref": "#/$defs/navigation" } },
+    "console": { "type": "array", "items": { "$ref": "#/$defs/consoleRecord" } },
+    "network": { "type": "array", "items": { "$ref": "#/$defs/networkRecord" } },
+    "errors": { "type": "array", "items": { "$ref": "#/$defs/errorRecord" } },
+    "screenshots": { "type": "array", "items": { "$ref": "#/$defs/screenshot" } },
+    "rrweb": { "$ref": "#/$defs/rrweb" },
+    "captureGaps": { "type": "array", "items": { "$ref": "#/$defs/captureGap" } },
+    "attachments": { "type": "array", "items": { "$ref": "#/$defs/attachment" } }
+  },
+  "$defs": {
+    "logicalId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "isoDateTime": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "nonNegativeNumber": { "type": "number", "minimum": 0 },
+    "safePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]+$"
+    },
+    "missingStatus": {
+      "enum": ["redacted", "omitted", "unsupported", "truncated", "error"]
+    },
+    "evidenceStatus": {
+      "enum": ["present", "redacted", "omitted", "unsupported", "truncated", "error"]
+    },
+    "missingEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": { "$ref": "#/$defs/missingStatus" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      }
+    },
+    "untrustedObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "trust"],
+      "properties": {
+        "status": { "enum": ["present", "redacted", "truncated"] },
+        "trust": { "const": "untrusted_observation" },
+        "value": { "type": "string", "maxLength": 16384 },
+        "originalLength": { "$ref": "#/$defs/nonNegativeInteger" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "present" } }, "required": ["status"] },
+          "then": { "required": ["value"] }
+        },
+        {
+          "if": { "properties": { "status": { "const": "truncated" } }, "required": ["status"] },
+          "then": { "required": ["value", "originalLength"] }
+        },
+        {
+          "if": { "properties": { "status": { "const": "redacted" } }, "required": ["status"] },
+          "then": { "not": { "required": ["value"] } }
+        }
+      ]
+    },
+    "observationOrMissing": {
+      "oneOf": [
+        { "$ref": "#/$defs/untrustedObservation" },
+        { "$ref": "#/$defs/missingEvidence" }
+      ]
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "build": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "rrwebVersion": { "type": "string", "minLength": 1, "maxLength": 100 }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "state", "startedAt", "endedAt", "durationMs"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "state": { "enum": ["completed", "interrupted"] },
+        "startedAt": { "$ref": "#/$defs/isoDateTime" },
+        "endedAt": { "$ref": "#/$defs/isoDateTime" },
+        "durationMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "title": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "viewport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "devicePixelRatio"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1, "maximum": 32768 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 32768 },
+        "devicePixelRatio": { "type": "number", "exclusiveMinimum": 0, "maximum": 16 }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "browser": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+            "version": {
+              "oneOf": [
+                { "type": "string", "minLength": 1, "maxLength": 100 },
+                { "$ref": "#/$defs/missingEvidence" }
+              ]
+            }
+          }
+        },
+        "platform": { "type": "string", "maxLength": 200 },
+        "userAgent": { "type": "string", "maxLength": 1000 },
+        "locale": { "type": "string", "maxLength": 100 },
+        "timezone": { "type": "string", "maxLength": 100 },
+        "viewport": { "$ref": "#/$defs/viewport" }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "localOnly",
+        "inputValues",
+        "urlQueryValues",
+        "requestBodies",
+        "responseBodies",
+        "cookies",
+        "sensitiveHeaders",
+        "redactionCount",
+        "redactionCountSemantics",
+        "warnings"
+      ],
+      "properties": {
+        "localOnly": { "const": true },
+        "inputValues": { "const": "redacted" },
+        "urlQueryValues": { "const": "redacted" },
+        "requestBodies": { "const": "omitted" },
+        "responseBodies": { "const": "omitted" },
+        "cookies": { "const": "omitted" },
+        "sensitiveHeaders": { "const": "omitted" },
+        "redactionCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "redactionCountSemantics": { "const": "minimum_observed" },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+          "maxItems": 100
+        }
+      }
+    },
+    "coverageArea": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "droppedCount", "reasons"],
+      "properties": {
+        "status": { "enum": ["complete", "partial", "off"] },
+        "droppedCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+          "maxItems": 1000
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["semantic", "rrweb", "console", "network", "screenshots"],
+      "properties": {
+        "semantic": { "$ref": "#/$defs/coverageArea" },
+        "rrweb": { "$ref": "#/$defs/coverageArea" },
+        "console": { "$ref": "#/$defs/coverageArea" },
+        "network": { "$ref": "#/$defs/coverageArea" },
+        "screenshots": { "$ref": "#/$defs/coverageArea" }
+      }
+    },
+    "tab": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "windowId", "initialUrl", "openedAtOffsetMs", "status"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "windowId": { "$ref": "#/$defs/logicalId" },
+        "openerTabId": { "$ref": "#/$defs/logicalId" },
+        "initialUrl": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "finalUrl": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "title": { "$ref": "#/$defs/observationOrMissing" },
+        "openedAtOffsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "closedAtOffsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "status": { "enum": ["open", "closed", "unavailable"] }
+      }
+    },
+    "locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "value", "confidence"],
+      "properties": {
+        "strategy": {
+          "enum": ["test-id", "role-name", "id", "name", "label", "attributes", "css", "xpath"]
+        },
+        "value": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "rect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "width": { "$ref": "#/$defs/nonNegativeNumber" },
+        "height": { "$ref": "#/$defs/nonNegativeNumber" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trust", "tagName", "locators", "framePath", "shadowPath"],
+      "properties": {
+        "trust": { "const": "untrusted_observation" },
+        "tagName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "role": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "accessibleName": { "$ref": "#/$defs/observationOrMissing" },
+        "text": { "$ref": "#/$defs/observationOrMissing" },
+        "locators": { "type": "array", "items": { "$ref": "#/$defs/locator" }, "maxItems": 20 },
+        "framePath": { "type": "array", "items": { "type": "string", "maxLength": 4096 }, "maxItems": 32 },
+        "shadowPath": { "type": "array", "items": { "type": "string", "maxLength": 4096 }, "maxItems": 32 },
+        "rect": { "$ref": "#/$defs/rect" }
+      }
+    },
+    "redactedInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "inputType"],
+      "properties": {
+        "status": { "const": "redacted" },
+        "inputType": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "lengthBucket": { "enum": ["empty", "1-4", "5-8", "9-16", "17+"] }
+      }
+    },
+    "scrollPosition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": { "type": "integer" },
+        "y": { "type": "integer" }
+      }
+    },
+    "droppedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mimeType"],
+      "properties": {
+        "mimeType": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "size": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "seq", "offsetMs", "tabId", "action"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "tabId": { "$ref": "#/$defs/logicalId" },
+        "frameId": { "$ref": "#/$defs/logicalId" },
+        "documentId": { "$ref": "#/$defs/logicalId" },
+        "action": {
+          "enum": ["click", "double_click", "context_menu", "fill", "change", "select", "check", "uncheck", "submit", "shortcut", "scroll", "drag_drop"]
+        },
+        "target": {
+          "oneOf": [
+            { "$ref": "#/$defs/target" },
+            { "$ref": "#/$defs/missingEvidence" }
+          ]
+        },
+        "observation": { "$ref": "#/$defs/observationOrMissing" },
+        "input": { "$ref": "#/$defs/redactedInput" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "modifiers": {
+          "type": "array",
+          "items": { "enum": ["Alt", "Control", "Meta", "Shift"] },
+          "uniqueItems": true,
+          "maxItems": 4
+        },
+        "mouseButton": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "scroll": { "$ref": "#/$defs/scrollPosition" },
+        "files": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/droppedFile" },
+          "maxItems": 100
+        },
+        "selectedCount": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "navigation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "seq", "offsetMs", "tabId", "kind", "phase", "outcome", "url"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "tabId": { "$ref": "#/$defs/logicalId" },
+        "frameId": { "$ref": "#/$defs/logicalId" },
+        "kind": { "enum": ["document", "history", "hash", "reload", "back_forward", "new_tab"] },
+        "phase": { "enum": ["started", "committed", "completed", "failed", "history_state", "fragment_updated", "observed"] },
+        "outcome": { "enum": ["pending", "completed", "failed"] },
+        "url": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "title": { "$ref": "#/$defs/observationOrMissing" },
+        "transitionType": { "type": "string", "maxLength": 200 },
+        "error": { "$ref": "#/$defs/observationOrMissing" }
+      }
+    },
+    "consoleRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "seq", "offsetMs", "tabId", "level", "message", "repeatCount"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "tabId": { "$ref": "#/$defs/logicalId" },
+        "frameId": { "$ref": "#/$defs/logicalId" },
+        "level": { "enum": ["warn", "error"] },
+        "message": { "$ref": "#/$defs/observationOrMissing" },
+        "repeatCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "stringOrMissing": {
+      "oneOf": [
+        { "type": "string", "maxLength": 1000 },
+        { "$ref": "#/$defs/missingEvidence" }
+      ]
+    },
+    "numberOrMissing": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonNegativeInteger" },
+        { "$ref": "#/$defs/missingEvidence" }
+      ]
+    },
+    "networkRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "seq", "offsetMs", "tabId", "method", "url", "resourceType", "outcome"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "tabId": { "$ref": "#/$defs/logicalId" },
+        "method": { "type": "string", "pattern": "^[A-Z]+$", "maxLength": 20 },
+        "url": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "resourceType": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "outcome": { "enum": ["completed", "failed", "redirected"] },
+        "statusCode": { "type": "integer", "minimum": 100, "maximum": 599 },
+        "durationMs": { "$ref": "#/$defs/nonNegativeNumber" },
+        "fromCache": { "type": "boolean" },
+        "contentType": { "$ref": "#/$defs/stringOrMissing" },
+        "encodedSize": { "$ref": "#/$defs/numberOrMissing" },
+        "error": { "$ref": "#/$defs/observationOrMissing" }
+      }
+    },
+    "errorRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "seq", "offsetMs", "tabId", "kind", "message"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "tabId": { "$ref": "#/$defs/logicalId" },
+        "frameId": { "$ref": "#/$defs/logicalId" },
+        "kind": { "enum": ["window_error", "unhandled_rejection", "resource_error", "capture_error"] },
+        "message": { "$ref": "#/$defs/observationOrMissing" },
+        "stack": { "$ref": "#/$defs/observationOrMissing" },
+        "sourceUrl": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 4096 },
+            { "$ref": "#/$defs/missingEvidence" }
+          ]
+        }
+      }
+    },
+    "screenshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "seq", "offsetMs", "tabId", "trigger", "status", "redactionCount"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "tabId": { "$ref": "#/$defs/logicalId" },
+        "trigger": { "enum": ["manual", "error", "navigation", "stop"] },
+        "status": { "$ref": "#/$defs/evidenceStatus" },
+        "path": { "$ref": "#/$defs/safePath" },
+        "mimeType": { "enum": ["image/webp", "image/png"] },
+        "width": { "type": "integer", "minimum": 1, "maximum": 32768 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 32768 },
+        "redactionCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "present" } }, "required": ["status"] },
+          "then": { "required": ["path", "mimeType", "width", "height"] },
+          "else": {
+            "required": ["reason"],
+            "not": {
+              "anyOf": [
+                { "required": ["path"] },
+                { "required": ["mimeType"] },
+                { "required": ["width"] },
+                { "required": ["height"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "rrwebSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "tabId", "startSeq", "endSeq", "startedAtOffsetMs", "endedAtOffsetMs", "status", "eventCount", "droppedCount"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "tabId": { "$ref": "#/$defs/logicalId" },
+        "frameId": { "$ref": "#/$defs/logicalId" },
+        "startSeq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "endSeq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "startedAtOffsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "endedAtOffsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "status": { "$ref": "#/$defs/evidenceStatus" },
+        "path": { "$ref": "#/$defs/safePath" },
+        "eventCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "droppedCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "present" } }, "required": ["status"] },
+          "then": { "required": ["path"] },
+          "else": {
+            "required": ["reason"],
+            "not": { "required": ["path"] }
+          }
+        }
+      ]
+    },
+    "rrweb": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "segments"],
+      "properties": {
+        "status": { "enum": ["complete", "partial", "off"] },
+        "segments": { "type": "array", "items": { "$ref": "#/$defs/rrwebSegment" } }
+      }
+    },
+    "captureGap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "seq", "offsetMs", "source", "status", "reason"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
+        "source": { "enum": ["semantic", "rrweb", "console", "network", "screenshot", "navigation", "scope", "lifecycle"] },
+        "status": { "$ref": "#/$defs/missingStatus" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "tabId": { "$ref": "#/$defs/logicalId" },
+        "frameId": { "$ref": "#/$defs/logicalId" },
+        "droppedCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "observation": { "$ref": "#/$defs/untrustedObservation" }
+      }
+    },
+    "attachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "purpose"],
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "status": { "$ref": "#/$defs/evidenceStatus" },
+        "path": { "$ref": "#/$defs/safePath" },
+        "mimeType": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "size": { "$ref": "#/$defs/nonNegativeInteger" },
+        "purpose": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "relatedId": { "$ref": "#/$defs/logicalId" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "present" } }, "required": ["status"] },
+          "then": { "required": ["path", "mimeType", "size"] },
+          "else": {
+            "required": ["reason"],
+            "not": {
+              "anyOf": [
+                { "required": ["path"] },
+                { "required": ["mimeType"] },
+                { "required": ["size"] }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
