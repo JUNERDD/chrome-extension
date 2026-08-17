@@ -1,0 +1,25 @@
+# Dependencies and package manager state
+node_modules/
+.pnpm-store/
+
+# WXT and build output
+.wxt/
+.output/
+dist/
+coverage/
+
+# Test output
+playwright-report/
+test-results/
+
+# Local recordings and planning scratch files
+tmp/
+recordings/
+*.bugtrace.zip
+
+# Environment and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
