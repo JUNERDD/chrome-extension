@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bugtrace privacy fixture</title>
+    <style>
+      body { max-width: 42rem; margin: 3rem auto; font: 16px/1.5 system-ui, sans-serif; }
+      form { display: grid; gap: 1rem; }
+      label { display: grid; gap: .35rem; }
+      input, textarea, select, button, [contenteditable] { box-sizing: border-box; min-height: 2.5rem; padding: .55rem; font: inherit; }
+      .css-data-sentinel { background-image: url(data:text/plain,BUGTRACE_SENTINEL_CSS_TEXT_17bf); }
+      .zero-box-secret { display: block; width: 257px; height: 61px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Controlled privacy fixture</h1>
+      <form id="fixture-form">
+        <input id="hidden-csrf" name="csrf" type="hidden" value="BUGTRACE_SENTINEL_HIDDEN_123456" />
+        <label>Password <input id="password" name="password" type="password" autocomplete="current-password" /></label>
+        <label>One-time code <input id="otp" name="otp" inputmode="numeric" autocomplete="one-time-code" /></label>
+        <label>API token <textarea id="api-token" name="api-token" data-sensitive></textarea></label>
+        <label>Choice <input id="choice" name="choice" type="checkbox" value="BUGTRACE_SENTINEL_CHECKBOX_lowsecret" /></label>
+        <label>Secret option
+          <select id="secret-option" name="secret-option">
+            <option value="BUGTRACE_SENTINEL_OPTION_VALUE_f48b">BUGTRACE_SENTINEL_OPTION_TEXT_38ab</option>
+            <option value="safe">Safe option</option>
+          </select>
+        </label>
+        <div id="editable" role="textbox" contenteditable aria-label="Editable notes"></div>
+        <label>ARIA echo <input id="aria-echo" name="aria-echo" aria-label="ARIA echo" /></label>
+        <label>Paused-only value <input id="paused-value" name="paused-value" /></label>
+        <button type="button" id="private-target" data-private>BUGTRACE_SENTINEL_PRIVATE_BUTTON_7ce2</button>
+        <button type="button" id="masked-target" data-bugtrace-mask>BUGTRACE_SENTINEL_MASK_BUTTON_5ab4</button>
+        <button type="button" id="emit-diagnostics">Emit controlled diagnostics</button>
+        <button type="submit" id="submit">Submit fixture</button>
+      </form>
+      <div data-token="BUGTRACE_SENTINEL_DATA_TOKEN_12cd"></div>
+      <div style="background-image:url(data:text/plain,BUGTRACE_SENTINEL_DATA_URL_91ef)"></div>
+      <a href="https://example.test/image?user=BUGTRACE_SENTINEL_ATTR_URL_48aa"
+         onclick="void 'BUGTRACE_SENTINEL_HANDLER_d330'">Fixture link</a>
+      <iframe title="private srcdoc" srcdoc="<input value='BUGTRACE_SENTINEL_SRCDOC_8bad'>"></iframe>
+      <object hidden data="data:text/plain,BUGTRACE_SENTINEL_OBJECT_DATA_27ca"></object>
+      <div role="textbox" aria-label="Custom editor" aria-valuetext="BUGTRACE_SENTINEL_ROLE_VALUE_72bd">BUGTRACE_SENTINEL_ROLE_TEXT_83ce</div>
+      <div data-bugtrace-mask style="display: contents"><span class="zero-box-secret">BUGTRACE_SENTINEL_ZERO_BOX_3fd1</span></div>
+      <div id="open-shadow-mask" data-bugtrace-mask style="display: contents"></div>
+      <output id="result" aria-live="polite"></output>
+    </main>
+    <script>
+      const consoleSentinel = 'BUGTRACE_SENTINEL_CONSOLE_5d93b6';
+      const networkSentinel = 'BUGTRACE_SENTINEL_NETWORK_808b54';
+      const cardSentinel = '4242 4242 4242 4242';
+      const unicodeCardSentinel = '4242\u00a04242\u22124242\u20094242';
+      const appWarn = console.warn;
+      window.__appWarnCount = 0;
+      window.__appWarnWrapper = (...args) => {
+        window.__appWarnCount += 1;
+        appWarn.apply(console, args);
+      };
+      console.warn = window.__appWarnWrapper;
+
+      document.querySelector('#aria-echo').addEventListener('input', (event) => {
+        event.currentTarget.setAttribute('aria-label', event.currentTarget.value);
+      });
+
+      const shadow = document.querySelector('#open-shadow-mask').attachShadow({ mode: 'open' });
+      const shadowSecret = document.createElement('span');
+      shadowSecret.textContent = 'BUGTRACE_SENTINEL_OPEN_SHADOW_4ac2';
+      shadowSecret.style.cssText = 'display:block;width:233px;height:53px';
+      shadow.append(shadowSecret);
+
+      document.querySelector('#emit-diagnostics').addEventListener('click', async () => {
+        console.warn(`token=${consoleSentinel} card=${cardSentinel} unicode-card=${unicodeCardSentinel}`);
+        await fetch(`/api/failure?token=${networkSentinel}`);
+        document.querySelector('#result').textContent = 'diagnostics emitted';
+      });
+
+      document.querySelector('#private-target').addEventListener('click', () => {
+        document.querySelector('#result').textContent = 'private target clicked';
+      });
+      document.querySelector('#masked-target').addEventListener('click', () => {
+        document.querySelector('#result').textContent = 'masked target clicked';
+      });
+
+      document.querySelector('#fixture-form').addEventListener('submit', (event) => {
+        event.preventDefault();
+        document.querySelector('#result').textContent = 'submitted';
+      });
+    </script>
+  </body>
+</html>
