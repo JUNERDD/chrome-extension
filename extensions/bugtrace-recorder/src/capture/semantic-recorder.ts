@@ -19,6 +19,40 @@ const SAFE_KEYS = new Set([
   'Delete',
 ]);
 
+const MODIFIER_KEYS = new Set(['Alt', 'AltGraph', 'Control', 'Meta', 'Shift']);
+
+export interface KeyObservationPolicyInput {
+  key: string;
+  altKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  isComposing: boolean;
+  altGraph: boolean;
+  sensitiveTextContext: boolean;
+}
+
+/**
+ * Character-producing modifier sequences can reveal the physical keys used to enter a secret.
+ * Keep navigation keys and genuine shortcuts, but suppress Alt/AltGraph/IME text entry while an
+ * editable or explicitly blocked target owns focus.
+ */
+export function shouldRecordKeyObservation(input: KeyObservationPolicyInput): boolean {
+  if (MODIFIER_KEYS.has(input.key)) return false;
+  if (input.sensitiveTextContext && (input.isComposing || input.altGraph)) return false;
+  if (SAFE_KEYS.has(input.key)) return true;
+
+  const hasCommandModifier = input.altKey || input.ctrlKey || input.metaKey;
+  if (!hasCommandModifier) return false;
+  if (
+    input.sensitiveTextContext &&
+    input.altKey &&
+    ([...input.key].length === 1 || ['Dead', 'Process', 'Unidentified'].includes(input.key))
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function observedAt(): number {
   return performance.timeOrigin + performance.now();
 }
@@ -155,10 +189,17 @@ export class SemanticRecorder {
 
   private readonly handleKeydown = (event: KeyboardEvent): void => {
     if (!event.isTrusted) return;
-    const hasCommandModifier = event.altKey || event.ctrlKey || event.metaKey;
-    if (!SAFE_KEYS.has(event.key) && !hasCommandModifier) return;
     const target = elementFromEvent(event);
     if (!target) return;
+    if (!shouldRecordKeyObservation({
+      key: event.key,
+      altKey: event.altKey,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      isComposing: event.isComposing,
+      altGraph: event.getModifierState('AltGraph'),
+      sensitiveTextContext: isSensitiveTextContext(target),
+    })) return;
     const code = /^[A-Za-z0-9]{1,40}$/u.test(event.code) ? event.code : 'shortcut';
     this.emit({
       observedAt: observedAt(),
@@ -186,6 +227,29 @@ export class SemanticRecorder {
       data: { action: 'scroll', x: Math.round(x), y: Math.round(y), target: targetSummary(target) },
     });
   };
+}
+
+function isSensitiveTextContext(element: Element): boolean {
+  let current: Element | null = element;
+  while (current) {
+    if (
+      isBlockedTarget(current) ||
+      current instanceof HTMLInputElement ||
+      current instanceof HTMLTextAreaElement ||
+      current instanceof HTMLSelectElement ||
+      (current instanceof HTMLElement && current.isContentEditable) ||
+      ['textbox', 'searchbox', 'combobox'].includes(current.getAttribute('role') ?? '')
+    ) {
+      return true;
+    }
+    if (current.parentElement) {
+      current = current.parentElement;
+      continue;
+    }
+    const root = current.getRootNode();
+    current = root instanceof ShadowRoot ? root.host : null;
+  }
+  return false;
 }
 
 function modifierKeys(event: MouseEvent | KeyboardEvent): string[] {

@@ -4,6 +4,10 @@ export interface ScopedTab {
   readonly windowId: number | null;
   readonly addedAtMs: number;
   readonly closedAtMs: number | null;
+  /** Chrome replaced this tab with another identity while preserving the logical page. */
+  readonly replacedByTabId?: number;
+  /** Chrome created this identity as the replacement for another scoped tab. */
+  readonly replacesTabId?: number;
 }
 
 export interface SessionTabScope {
@@ -232,22 +236,37 @@ export function replaceScopedTab(
       `Replacement tab ${input.addedTabId} already belongs to the recording scope.`,
     );
   }
+  const replacedAtMs = input.addedAtMs ?? Date.now();
+  assertTimestamp(replacedAtMs, 'addedAtMs');
+  if (replacedAtMs < removed.addedAtMs) {
+    throw new RangeError('Replacement addedAtMs cannot be earlier than the replaced tab.');
+  }
   const replacementWindowId = input.windowId ?? removed.windowId;
   return {
     rootTabId:
       scope.rootTabId === input.removedTabId ? input.addedTabId : scope.rootTabId,
-    tabs: scope.tabs.map((candidate) => {
-      if (candidate.tabId === input.removedTabId) {
-        return {
-          ...candidate,
-          tabId: input.addedTabId,
-          windowId: replacementWindowId,
-        };
-      }
-      return candidate.parentTabId === input.removedTabId
-        ? { ...candidate, parentTabId: input.addedTabId }
-        : candidate;
-    }),
+    tabs: [
+      ...scope.tabs.map((candidate) => {
+        if (candidate.tabId === input.removedTabId) {
+          return {
+            ...candidate,
+            closedAtMs: replacedAtMs,
+            replacedByTabId: input.addedTabId,
+          };
+        }
+        return candidate.parentTabId === input.removedTabId
+          ? { ...candidate, parentTabId: input.addedTabId }
+          : candidate;
+      }),
+      {
+        tabId: input.addedTabId,
+        parentTabId: removed.parentTabId,
+        windowId: replacementWindowId,
+        addedAtMs: replacedAtMs,
+        closedAtMs: null,
+        replacesTabId: input.removedTabId,
+      },
+    ],
   };
 }
 

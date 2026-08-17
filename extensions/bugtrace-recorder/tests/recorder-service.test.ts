@@ -337,6 +337,14 @@ describe('RecorderService lifecycle transport', () => {
 
     await service.handleTabDetached(7, 3);
     await service.handleTabAttached(7, 9);
+    await service.handleNetworkStart({
+      requestId: 'replaced-pending',
+      tabId: 7,
+      method: 'GET',
+      type: 'xmlhttprequest',
+      url: 'https://example.test/api/replaced',
+      timeStamp: Date.now(),
+    });
     mocks.activeTab = { id: 12, windowId: 9, url: 'https://example.test/replaced' };
     await service.handleTabReplaced(12, 7);
 
@@ -357,6 +365,24 @@ describe('RecorderService lifecycle transport', () => {
     ).toBe(true);
     expect(mocks.events.some((event) =>
       event.kind === 'tab' && event.data.action === 'replaced'),
+    ).toBe(true);
+    expect(mocks.events.some((event) =>
+      event.kind === 'gap' && event.data.droppedCount === 1 &&
+      String(event.data.reason).startsWith('Chrome replaced a scoped tab')),
+    ).toBe(true);
+
+    await service.handleNetworkStart({
+      requestId: 'closed-pending',
+      tabId: 8,
+      method: 'GET',
+      type: 'xmlhttprequest',
+      url: 'https://example.test/api/closed',
+      timeStamp: Date.now(),
+    });
+    await service.handleTabRemoved(8);
+    expect(mocks.events.some((event) =>
+      event.kind === 'gap' && event.data.droppedCount === 1 &&
+      String(event.data.reason).startsWith('A scoped tab closed with')),
     ).toBe(true);
   });
 
@@ -383,5 +409,121 @@ describe('RecorderService lifecycle transport', () => {
     const rehydrated = new RecorderService();
     await rehydrated.ensureInitialized();
     expect(rehydrated.getViewState().gapCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('reserves network capacity before asynchronous persistence so concurrent completions cannot exceed the limit', async () => {
+    const service = new RecorderService();
+    await service.executeCommand('record');
+    Reflect.set(service, 'networkCount', 4_999);
+
+    let releaseFirstWrite!: () => void;
+    const firstWriteGate = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let firstNetworkWriteStarted = false;
+    mocks.appendEvents.mockImplementation(async (events: typeof mocks.events) => {
+      if (!firstNetworkWriteStarted && events.some((event) => event.kind === 'network')) {
+        firstNetworkWriteStarted = true;
+        await firstWriteGate;
+      }
+      mocks.events.push(...events);
+    });
+
+    const first = service.handleNetworkEnd({
+      requestId: 'at-budget',
+      tabId: 7,
+      method: 'GET',
+      type: 'xmlhttprequest',
+      url: 'https://example.test/api/first',
+      timeStamp: Date.now(),
+      statusCode: 200,
+    });
+    await vi.waitFor(() => expect(firstNetworkWriteStarted).toBe(true));
+    const second = service.handleNetworkEnd({
+      requestId: 'over-budget-concurrent',
+      tabId: 7,
+      method: 'GET',
+      type: 'xmlhttprequest',
+      url: 'https://example.test/api/second',
+      timeStamp: Date.now(),
+      statusCode: 200,
+    });
+
+    releaseFirstWrite();
+    await Promise.all([first, second]);
+
+    expect(mocks.events.filter((event) => event.kind === 'network')).toHaveLength(1);
+    expect(mocks.events.some((event) =>
+      event.kind === 'gap' && event.data.droppedCount === 1 &&
+      String(event.data.reason).includes('Network evidence budget reached')),
+    ).toBe(true);
+    expect(Reflect.get(service, 'networkCount')).toBe(5_000);
+  });
+
+  it('declares in-flight network outcomes lost at pause and stop boundaries', async () => {
+    const service = new RecorderService();
+    await service.executeCommand('record');
+    await service.handleNetworkStart({
+      requestId: 'pause-pending-1',
+      tabId: 7,
+      method: 'GET',
+      type: 'xmlhttprequest',
+      url: 'https://example.test/api/slow-1',
+      timeStamp: Date.now(),
+    });
+    await service.handleNetworkStart({
+      requestId: 'pause-pending-2',
+      tabId: 7,
+      method: 'GET',
+      type: 'xmlhttprequest',
+      url: 'https://example.test/api/slow-2',
+      timeStamp: Date.now(),
+    });
+    await service.executeCommand('pause');
+
+    expect(mocks.events.some((event) =>
+      event.kind === 'gap' && event.data.droppedCount === 2 &&
+      String(event.data.reason).startsWith('Pause ended correlation')),
+    ).toBe(true);
+
+    await service.executeCommand('resume');
+    await service.handleNetworkStart({
+      requestId: 'stop-pending',
+      tabId: 7,
+      method: 'GET',
+      type: 'xmlhttprequest',
+      url: 'https://example.test/api/slow-3',
+      timeStamp: Date.now(),
+    });
+    await service.executeCommand('stop');
+
+    expect(mocks.events.some((event) =>
+      event.kind === 'gap' && event.data.droppedCount === 1 &&
+      String(event.data.reason).startsWith('Stop ended correlation')),
+    ).toBe(true);
+  });
+
+  it('seals an interrupted session without contacting or screenshotting stale browser scope', async () => {
+    const sessionId = '62677126-2b8d-4fac-9e89-605f9e840bcb';
+    const now = Date.now();
+    mocks.persisted = record(
+      createIdleState(now - 1_000),
+      { sessionId, rootTabId: 1, rootWindowId: 1 },
+      now - 500,
+    );
+    mocks.runtimeRestarted = true;
+    mocks.activeTab = { id: 77, windowId: 9, url: 'https://unrelated.test/' };
+
+    const service = new RecorderService();
+    await service.ensureInitialized();
+    expect(service.getViewState().status).toBe('interrupted');
+    await service.executeCommand('stop');
+
+    expect(service.getViewState().status).toBe('completed');
+    expect(mocks.tabsSendMessage).not.toHaveBeenCalled();
+    expect(mocks.captureRedactedScreenshot).not.toHaveBeenCalled();
+    expect(mocks.events.some((event) =>
+      event.kind === 'gap' && String(event.data.reason).includes('pre-restart tab scope')),
+    ).toBe(true);
   });
 });

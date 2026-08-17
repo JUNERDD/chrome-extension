@@ -204,6 +204,63 @@ function stableCssPath(element: Element): string {
   return segments.join(' > ');
 }
 
+const CROSS_ORIGIN_FRAME_MARKER = '[frame-unavailable:cross-origin]';
+
+/**
+ * Returns outer-to-inner host/frame locators for the DOM context observable from this frame.
+ * A cross-origin parent cannot expose its iframe element, so that boundary is explicit rather
+ * than being misrepresented as a top-level target.
+ */
+export function describeElementContextPaths(
+  element: Element,
+): Pick<TargetDescriptor, 'framePath' | 'shadowPath'> {
+  const shadowPath: string[] = [];
+  let shadowNode: Element = element;
+  while (shadowPath.length < 32) {
+    const root = shadowNode.getRootNode();
+    if (!(root instanceof ShadowRoot)) break;
+    shadowPath.unshift(stableCssPath(root.host));
+    shadowNode = root.host;
+  }
+
+  const framePath: string[] = [];
+  let view: Window | null = element.ownerDocument.defaultView;
+  while (view && framePath.length < 32) {
+    let top: Window | null;
+    try {
+      top = view.top;
+    } catch {
+      framePath.unshift(CROSS_ORIGIN_FRAME_MARKER);
+      break;
+    }
+    if (top === null || view === top) break;
+
+    let frameElement: Element | null;
+    try {
+      frameElement = view.frameElement;
+    } catch {
+      frameElement = null;
+    }
+    if (frameElement === null) {
+      framePath.unshift(CROSS_ORIGIN_FRAME_MARKER);
+      break;
+    }
+    framePath.unshift(stableCssPath(frameElement));
+
+    let parent: Window;
+    try {
+      parent = view.parent;
+    } catch {
+      framePath.unshift(CROSS_ORIGIN_FRAME_MARKER);
+      break;
+    }
+    if (parent === view) break;
+    view = parent;
+  }
+
+  return { framePath, shadowPath };
+}
+
 export function elementFromEvent(event: Event): Element | null {
   return (event.composedPath().find((candidate): candidate is Element => candidate instanceof Element) ?? null);
 }
@@ -231,14 +288,15 @@ export function describeTarget(element: Element): TargetDescriptor {
   addLocator({ kind: 'css', value: stableCssPath(element), confidence: 0.45 });
 
   const rect = element.getBoundingClientRect();
+  const contextPaths = describeElementContextPaths(element);
   return {
     tag: element.tagName.toLowerCase(),
     role,
     accessibleName,
     text: isWithinEditableTextTarget(element) ? null : labelText(element),
     locators: locators.slice(0, 6),
-    framePath: [],
-    shadowPath: [],
+    framePath: contextPaths.framePath,
+    shadowPath: contextPaths.shadowPath,
     rect: {
       x: Math.round(rect.x),
       y: Math.round(rect.y),

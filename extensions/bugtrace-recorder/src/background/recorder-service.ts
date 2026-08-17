@@ -343,8 +343,16 @@ export class RecorderService {
     if (command === 'pause') {
       this.screenshotEpoch += 1;
       this.state = pause(this.state, now);
+      const pendingNetworkCount = this.clearPendingNetworkRequests();
       await this.screenshotQueue;
-      this.requestStarts.clear();
+      if (pendingNetworkCount > 0) {
+        await this.appendGap(
+          `Pause ended correlation for ${pendingNetworkCount} in-flight network request(s); their outcomes were not captured.`,
+          ['network'],
+          undefined,
+          pendingNetworkCount,
+        );
+      }
       await this.appendSystemEvent('session', { action: 'pause' });
       await this.persistAndBroadcast();
       return;
@@ -466,18 +474,35 @@ export class RecorderService {
       return;
     }
 
+    const stoppedFromInterrupted = this.state.status === 'interrupted';
     this.screenshotEpoch += 1;
     this.state = stop(this.state, now, 'user');
+    const pendingNetworkCount = this.clearPendingNetworkRequests();
     await this.screenshotQueue;
-    this.requestStarts.clear();
+    if (pendingNetworkCount > 0) {
+      await this.appendGap(
+        `Stop ended correlation for ${pendingNetworkCount} in-flight network request(s); their outcomes were not captured.`,
+        ['network'],
+        undefined,
+        pendingNetworkCount,
+      );
+    }
     await this.appendSystemEvent('session', { action: 'stop', phase: 'finalizing' });
-    await this.persistAndBroadcast();
-    await this.flushScopedTabs();
-    await this.captureScreenshot('stop').catch((error) => this.appendGap(String(error), ['screenshots']));
+    if (stoppedFromInterrupted) {
+      await this.appendGap(
+        'The interrupted session was sealed without contacting its pre-restart tab scope; final frame transport and a stop screenshot were intentionally skipped because persisted Chrome tab identities are no longer trustworthy.',
+        ['semantic', 'rrweb', 'console', 'network', 'screenshots', 'scope'],
+      );
+    }
+    await this.persistAndBroadcast(!stoppedFromInterrupted);
+    if (!stoppedFromInterrupted) {
+      await this.flushScopedTabs();
+      await this.captureScreenshot('stop').catch((error) => this.appendGap(String(error), ['screenshots']));
+    }
     this.screenshotEpoch += 1;
     this.state = finalize(this.state, Date.now());
     await this.appendSystemEvent('session', { action: 'finalize', phase: 'completed' }, true);
-    await this.persistAndBroadcast();
+    await this.persistAndBroadcast(!stoppedFromInterrupted);
     await this.openResults();
   }
 
@@ -544,9 +569,7 @@ export class RecorderService {
       revision: this.state.revision + 1,
       scope: markTabClosed(this.state.scope, tabId, Date.now()),
     };
-    for (const [requestId, start] of this.requestStarts) {
-      if (start.tabId === tabId) this.requestStarts.delete(requestId);
-    }
+    const pendingNetworkCount = this.clearPendingNetworkRequestsForTab(tabId);
     this.forgetContentClientsForTab(tabId);
     if (this.state.status === 'recording') {
       await this.appendChromeEvent('tab', tabId, { action: 'closed' });
@@ -555,6 +578,14 @@ export class RecorderService {
         ['semantic', 'rrweb', 'console'],
         tabId,
       );
+      if (pendingNetworkCount > 0) {
+        await this.appendGap(
+          `A scoped tab closed with ${pendingNetworkCount} in-flight network request(s); their outcomes were not captured.`,
+          ['network'],
+          tabId,
+          pendingNetworkCount,
+        );
+      }
     }
     await this.persistAndBroadcast();
   }
@@ -625,15 +656,21 @@ export class RecorderService {
       });
       if (nextScope === this.state.scope) return;
       this.state = { ...this.state, revision: this.state.revision + 1, scope: nextScope };
-      for (const [requestId, start] of this.requestStarts) {
-        if (start.tabId === removedTabId) this.requestStarts.delete(requestId);
-      }
+      const pendingNetworkCount = this.clearPendingNetworkRequestsForTab(removedTabId);
       this.forgetContentClientsForTab(removedTabId);
       if (this.state.status === 'recording') {
         await this.appendChromeEvent('tab', addedTabId, {
           action: 'replaced',
           replacedTabId: `tab-${removedTabId}`,
         });
+        if (pendingNetworkCount > 0) {
+          await this.appendGap(
+            `Chrome replaced a scoped tab with ${pendingNetworkCount} in-flight network request(s); their outcomes were not captured.`,
+            ['network'],
+            removedTabId,
+            pendingNetworkCount,
+          );
+        }
       }
       await this.persistAndBroadcast();
     } finally {
@@ -724,6 +761,7 @@ export class RecorderService {
         1,
       );
     }
+    if (this.state.status !== 'recording' || !isOpenTabInScope(this.state.scope, observation.tabId)) return;
     this.requestStarts.set(observation.requestId, {
       startedAt: observation.timeStamp,
       method: observation.method,
@@ -763,9 +801,22 @@ export class RecorderService {
       );
       return;
     }
-    await this.appendChromeEvent('network', observation.tabId, data, observation.timeStamp, true);
     this.networkCount += 1;
     this.networkBytes += bytes;
+    try {
+      const eventId = await this.appendChromeEvent(
+        'network',
+        observation.tabId,
+        data,
+        observation.timeStamp,
+        true,
+      );
+      if (!eventId) throw new Error('Network evidence admission expired before persistence.');
+    } catch (error) {
+      this.networkCount = Math.max(0, this.networkCount - 1);
+      this.networkBytes = Math.max(0, this.networkBytes - bytes);
+      throw error;
+    }
   }
 
   private async acceptCaptureBatch(
@@ -1308,9 +1359,13 @@ export class RecorderService {
     await operation;
   }
 
-  private async persistAndBroadcast(): Promise<void> {
+  private async persistAndBroadcast(includeScopedTabs = true): Promise<void> {
     await this.persist();
-    const [, deliveryFailures] = await Promise.all([this.updateBadge(), this.broadcastState()]);
+    const view = this.getViewState();
+    const [, deliveryFailures] = await Promise.all([
+      this.updateBadge(),
+      includeScopedTabs ? this.broadcastState() : this.broadcastExtensionState(view),
+    ]);
     const deliveryKey = `${this.state.sessionId ?? 'idle'}:${this.state.revision}:${this.state.status}`;
     if (
       deliveryFailures > 0 &&
@@ -1329,16 +1384,21 @@ export class RecorderService {
 
   private async broadcastState(): Promise<number> {
     const view = this.getViewState();
-    void browser.runtime.sendMessage({
-      type: 'STATE_CHANGED',
-      state: view,
-      captureEnabled: false,
-    }).catch(() => undefined);
+    void this.broadcastExtensionState(view);
     return this.broadcastToScope(
       this.state,
       view,
       ACTIVE_STATUSES.has(this.state.status),
     );
+  }
+
+  private async broadcastExtensionState(view: RecorderViewState): Promise<number> {
+    await browser.runtime.sendMessage({
+      type: 'STATE_CHANGED',
+      state: view,
+      captureEnabled: false,
+    }).catch(() => undefined);
+    return 0;
   }
 
   private async broadcastToScope(
@@ -1410,6 +1470,22 @@ export class RecorderService {
       browser.action.setBadgeBackgroundColor({ color: badge.color }),
       browser.action.setTitle({ title: `Bugtrace Recorder · ${this.state.status}` }),
     ]);
+  }
+
+  private clearPendingNetworkRequests(): number {
+    const pendingCount = this.requestStarts.size;
+    this.requestStarts.clear();
+    return pendingCount;
+  }
+
+  private clearPendingNetworkRequestsForTab(tabId: number): number {
+    let pendingCount = 0;
+    for (const [requestId, start] of this.requestStarts) {
+      if (start.tabId !== tabId) continue;
+      this.requestStarts.delete(requestId);
+      pendingCount += 1;
+    }
+    return pendingCount;
   }
 
   private async openResults(): Promise<void> {

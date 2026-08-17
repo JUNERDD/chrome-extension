@@ -544,8 +544,19 @@ function windowId(value: unknown, fallback: number | string): string {
 function buildTabs(state: UnknownRecord, events: StoredEvent[], navigations: NavigationRecord[]): TabRecord[] {
   const scoped = scopeTabs(state);
   const uniqueEventTabs = [...new Set(events.map((event) => event.tabId).filter((value): value is string => value !== null))];
-  const rawTabs: UnknownRecord[] = scoped.length > 0 ? scoped : uniqueEventTabs.map((value) => ({ tabId: value }));
-  if (rawTabs.length === 0) rawTabs.push({ tabId: 'unknown' });
+  const rawTabs: UnknownRecord[] = [...scoped];
+  const scopedIds = new Set(scoped.map((item) => tabId(item.tabId)));
+  for (const value of uniqueEventTabs) {
+    if (scopedIds.has(tabId(value))) continue;
+    const firstEvent = events.find((event) => event.tabId === value);
+    rawTabs.push({
+      tabId: value,
+      windowId: firstEvent?.windowId,
+      scopeUnavailable: true,
+    });
+    scopedIds.add(tabId(value));
+  }
+  if (rawTabs.length === 0) rawTabs.push({ tabId: 'unknown', scopeUnavailable: true });
 
   return rawTabs.map((item, index) => {
     const id = tabId(item.tabId);
@@ -560,6 +571,11 @@ function buildTabs(state: UnknownRecord, events: StoredEvent[], navigations: Nav
     const startedAtMs = number(state.startedAtMs, openedAtMs);
     const closedAtMs = number(item.closedAtMs, -1);
     const opener = item.parentTabId;
+    const status: TabRecord['status'] = boolean(item.scopeUnavailable)
+      ? 'unavailable'
+      : closedAtMs >= 0
+        ? 'closed'
+        : 'open';
     return {
       id,
       windowId: windowId(item.windowId, index + 1),
@@ -568,7 +584,7 @@ function buildTabs(state: UnknownRecord, events: StoredEvent[], navigations: Nav
       ...(lastNavigation ? { finalUrl: lastNavigation.url } : {}),
       openedAtOffsetMs: integer(Math.max(0, openedAtMs - startedAtMs)),
       ...(closedAtMs >= 0 ? { closedAtOffsetMs: integer(Math.max(0, closedAtMs - startedAtMs)) } : {}),
-      status: closedAtMs >= 0 ? 'closed' : 'open',
+      status,
     };
   });
 }
@@ -730,7 +746,7 @@ function isoDate(value: number, fallback: string): string {
   return Number.isFinite(date.valueOf()) ? date.toISOString() : fallback;
 }
 
-interface IdentityMapper {
+export interface IdentityMapper {
   tab: (rawId: string) => string;
   window: (rawId: string) => string;
 }
@@ -780,7 +796,7 @@ function remapBrowserIdentities(trace: BugtraceTrace): IdentityMapper {
   return { tab: logicalTabId, window: logicalWindowId };
 }
 
-function buildLifecycleAttachment(
+export function buildLifecycleAttachment(
   events: StoredEvent[],
   identities: IdentityMapper,
   redact: (input: string) => string,
@@ -794,6 +810,8 @@ function buildLifecycleAttachment(
     const action = redact(text(event.data.action, 'observed')).slice(0, 100);
     const phase = redact(text(event.data.phase)).slice(0, 200);
     const opener = event.data.openerTabId;
+    const replaced = event.data.replacedTabId;
+    const previousWindow = event.data.previousWindowId;
     return {
       seq: integer(event.seq),
       offsetMs: integer(event.offsetMs),
@@ -805,6 +823,12 @@ function buildLifecycleAttachment(
       ...(event.windowId ? { windowId: identities.window(event.windowId) } : {}),
       ...(typeof opener === 'string' || typeof opener === 'number'
         ? { openerTabId: identities.tab(tabId(opener)) }
+        : {}),
+      ...(typeof replaced === 'string' || typeof replaced === 'number'
+        ? { replacedTabId: identities.tab(tabId(replaced)) }
+        : {}),
+      ...(typeof previousWindow === 'string' || typeof previousWindow === 'number'
+        ? { previousWindowId: identities.window(windowId(previousWindow, 'unknown')) }
         : {}),
     };
   });

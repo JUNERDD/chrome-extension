@@ -225,7 +225,7 @@ describe('tab scope lineage', () => {
     expect(updateScopedTabWindow(attached, 11, 9)).toBe(attached);
   });
 
-  it('rebinds root and descendant parentage when Chrome replaces a scoped tab id', () => {
+  it('preserves both identities and replacement lineage when Chrome replaces a scoped tab id', () => {
     const scope = addDescendantTab(
       createTabScope(10, { windowId: 1, addedAtMs: 5 }),
       { tabId: 11, openerTabId: 10, windowId: 1, addedAtMs: 6 },
@@ -234,15 +234,25 @@ describe('tab scope lineage', () => {
       removedTabId: 10,
       addedTabId: 20,
       windowId: 3,
+      addedAtMs: 7,
     });
 
     expect(replaced.rootTabId).toBe(20);
-    expect(isTabInScope(replaced, 10)).toBe(false);
+    expect(isTabInScope(replaced, 10)).toBe(true);
+    expect(isOpenTabInScope(replaced, 10)).toBe(false);
+    expect(isOpenTabInScope(replaced, 20)).toBe(true);
     expect(getTabLineage(replaced, 11)).toEqual([20, 11]);
+    expect(replaced.tabs.find((tab) => tab.tabId === 10)).toMatchObject({
+      windowId: 1,
+      addedAtMs: 5,
+      closedAtMs: 7,
+      replacedByTabId: 20,
+    });
     expect(replaced.tabs.find((tab) => tab.tabId === 20)).toMatchObject({
       windowId: 3,
-      addedAtMs: 5,
+      addedAtMs: 7,
       closedAtMs: null,
+      replacesTabId: 10,
     });
   });
 

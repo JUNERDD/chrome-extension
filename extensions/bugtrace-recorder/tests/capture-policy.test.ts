@@ -5,6 +5,37 @@ import {
   RRWEB_MASK_TEXT_SELECTOR,
   sanitizeRrwebEventsForCapture,
 } from '../src/capture/rrweb-segment';
+import { shouldRecordKeyObservation } from '../src/capture/semantic-recorder';
+
+describe('semantic keyboard privacy policy', () => {
+  const base = {
+    key: 'q',
+    altKey: false,
+    ctrlKey: false,
+    metaKey: false,
+    isComposing: false,
+    altGraph: false,
+    sensitiveTextContext: true,
+  };
+
+  it('suppresses character-producing Alt, AltGraph, and composition in sensitive text contexts', () => {
+    expect(shouldRecordKeyObservation({ ...base, altKey: true })).toBe(false);
+    expect(shouldRecordKeyObservation({ ...base, altKey: true, ctrlKey: true, altGraph: true })).toBe(false);
+    expect(shouldRecordKeyObservation({ ...base, isComposing: true })).toBe(false);
+  });
+
+  it('retains non-character shortcuts and combinations outside sensitive text contexts', () => {
+    expect(shouldRecordKeyObservation({ ...base, key: 'ArrowDown' })).toBe(true);
+    expect(shouldRecordKeyObservation({ ...base, ctrlKey: true })).toBe(true);
+    expect(shouldRecordKeyObservation({ ...base, key: 'F4', altKey: true })).toBe(true);
+    expect(shouldRecordKeyObservation({
+      ...base,
+      altKey: true,
+      sensitiveTextContext: false,
+    })).toBe(true);
+    expect(shouldRecordKeyObservation({ ...base, key: 'Control', ctrlKey: true })).toBe(false);
+  });
+});
 
 describe('rrweb privacy policy', () => {
   it('masks editable text that is not represented by a native input value', () => {

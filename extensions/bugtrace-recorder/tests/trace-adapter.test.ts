@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import type { StoredEvent } from '../src/storage';
-import { adaptNavigationEvent, adaptSemanticEvent } from '../src/ui/trace-adapter';
+import {
+  adaptNavigationEvent,
+  adaptSemanticEvent,
+  buildLifecycleAttachment,
+} from '../src/ui/trace-adapter';
 
 function event(kind: string, data: Record<string, unknown>): StoredEvent {
   return {
@@ -97,5 +101,55 @@ describe('stored trace adapter', () => {
         value: 'net::ERR_CONNECTION_RESET',
       },
     });
+  });
+
+  it('exports replacement and previous-window lifecycle identities explicitly', () => {
+    const replacement = event('tab', {
+      action: 'replaced',
+      replacedTabId: 'tab-80',
+    });
+    const detached = {
+      ...event('tab', {
+        action: 'detached',
+        previousWindowId: 'window-16',
+      }),
+      seq: 8,
+      tabId: 'tab-81',
+      windowId: null,
+    };
+    const tabIds = new Map([
+      ['tab-80', 'tab-1'],
+      ['tab-81', 'tab-2'],
+    ]);
+    const windowIds = new Map([
+      ['window-16', 'window-1'],
+      ['window-17', 'window-2'],
+    ]);
+    const lifecycle = buildLifecycleAttachment(
+      [replacement, detached],
+      {
+        tab: (rawId) => tabIds.get(rawId) ?? 'tab-unknown',
+        window: (rawId) => windowIds.get(rawId) ?? 'window-unknown',
+      },
+      (value) => value,
+    );
+
+    expect(lifecycle).not.toBeNull();
+    if (lifecycle === null || typeof lifecycle.resource.data !== 'string') {
+      throw new Error('Expected a text lifecycle attachment.');
+    }
+    expect(JSON.parse(lifecycle.resource.data).records).toEqual([
+      expect.objectContaining({
+        action: 'replaced',
+        tabId: 'tab-2',
+        windowId: 'window-2',
+        replacedTabId: 'tab-1',
+      }),
+      expect.objectContaining({
+        action: 'detached',
+        tabId: 'tab-2',
+        previousWindowId: 'window-1',
+      }),
+    ]);
   });
 });
