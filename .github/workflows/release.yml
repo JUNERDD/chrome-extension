@@ -119,6 +119,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+          include-hidden-files: true
 
   release:
     name: Publish GitHub Release
