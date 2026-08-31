@@ -44,18 +44,18 @@
     "@eslint/js": "9.39.2",
     "@playwright/test": "1.62.1",
     "@tailwindcss/vite": "4.3.3",
-    "@types/chrome": "0.2.6",
+    "@types/chrome": "0.2.7",
     "@types/node": "22.20.1",
     "@types/react": "19.2.18",
-    "@types/react-dom": "19.2.4",
+    "@types/react-dom": "19.2.5",
     "@wxt-dev/module-react": "1.2.2",
     "eslint": "9.39.2",
     "eslint-plugin-react-hooks": "7.1.1",
     "globals": "16.4.0",
     "typescript": "5.9.3",
-    "typescript-eslint": "8.67.0",
-    "vite": "8.2.1",
-    "vitest": "4.1.10",
+    "typescript-eslint": "8.68.0",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
     "wxt": "0.21.4"
   }
 }
