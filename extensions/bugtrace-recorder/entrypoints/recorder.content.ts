@@ -1,5 +1,15 @@
 import { browser } from 'wxt/browser';
-import { listSensitiveRects, RrwebSegmentRecorder, SemanticRecorder } from '../src/capture';
+import {
+  claimDocumentRecorderOwnership,
+  RrwebSegmentRecorder,
+  SemanticRecorder,
+} from '../src/capture';
+import { resolveLocale, translateMessage } from '../src/i18n/core';
+import {
+  getSystemLanguage,
+  loadLanguagePreference,
+  subscribeLanguagePreference,
+} from '../src/i18n/runtime';
 import type {
   BackgroundMessage,
   ClientCaptureEvent,
@@ -8,11 +18,11 @@ import type {
   TransportDropCounts,
   TransportDropSource,
 } from '../src/messaging';
-import { jsonUtf8ByteLength } from '../src/messaging';
+import { CAPTURE_PROTOCOL_VERSION, jsonUtf8ByteLength } from '../src/messaging';
 
 const CHANNEL = 'bugtrace-recorder:v1';
-const MAX_BATCH_BYTES = 3_500_000;
-const MAX_PENDING_TRANSPORT_BYTES = 8_000_000;
+const MAX_BATCH_BYTES = 32_000_000;
+const MAX_PENDING_TRANSPORT_BYTES = 256_000_000;
 const TRANSPORT_ACK_TIMEOUT_MS = 1_500;
 
 export default defineContentScript({
@@ -22,6 +32,7 @@ export default defineContentScript({
   noScriptStartedPostMessage: true,
   runAt: 'document_start',
   async main() {
+    if (!claimDocumentRecorderOwnership()) return;
     const clientId = crypto.randomUUID();
     const documentId = crypto.randomUUID();
     let localSeq = 0;
@@ -44,6 +55,24 @@ export default defineContentScript({
     let appliedState: RecorderViewState | null = null;
     const retiredSessionIds = new Set<string>();
     let overlay: ReturnType<typeof createStatusOverlay> | null = null;
+    let overlayLocale = resolveLocale(
+      await loadLanguagePreference().catch(() => 'system' as const),
+      getSystemLanguage(),
+    );
+
+    const overlayLabel = (state: RecorderViewState): string => {
+      const key = state.status === 'recording'
+        ? 'overlay.status.recording'
+        : state.status === 'paused'
+          ? 'overlay.status.paused'
+          : 'overlay.status.interrupted';
+      return translateMessage(overlayLocale, key);
+    };
+
+    subscribeLanguagePreference((preference) => {
+      overlayLocale = resolveLocale(preference, getSystemLanguage());
+      if (overlay && appliedState) overlay.update(appliedState);
+    });
 
     const sourceForEvent = (event: ClientCaptureEvent): TransportDropSource => {
       if (event.kind === 'error' || event.kind === 'console') return 'console';
@@ -179,12 +208,12 @@ export default defineContentScript({
         noteDropped([candidate]);
         if (candidate.kind === 'rrweb') rrwebRecorder?.stop();
         recordCollectorFailure(
-          new Error(`${candidate.kind} event exceeded the 3.5 MB per-message limit.`),
+          new Error(`${candidate.kind} event exceeded the 32 MB per-message limit.`),
           [candidate.kind === 'error' ? 'console' : candidate.kind],
         );
         return;
       }
-      if (buffer.length > 0 && (bufferedBytes + bytes > 350_000 || buffer.length >= 50)) {
+      if (buffer.length > 0 && (bufferedBytes + bytes > 8_000_000 || buffer.length >= 200)) {
         void flush().catch(() => undefined);
       }
       buffer.push(candidate);
@@ -207,8 +236,7 @@ export default defineContentScript({
       rrwebRecorder?.stop();
       rrwebRecorder = null;
       window.dispatchEvent(new CustomEvent(`${CHANNEL}:diagnostics-stop`));
-      // Pending semantic input is emitted synchronously by SemanticRecorder.stop(). Disable new
-      // observations only after that tail has entered the buffer, then drain the transport.
+      // Disable new observations only after both recorders have detached, then drain transport.
       captureEnabled = false;
       if (!flushEvidence) {
         await sendQueue;
@@ -251,7 +279,7 @@ export default defineContentScript({
       }
 
       if (inScope && ['recording', 'paused', 'interrupted'].includes(nextState.status)) {
-        overlay ??= createStatusOverlay();
+        overlay ??= createStatusOverlay(overlayLabel);
         overlay.update(nextState);
       } else {
         overlay?.remove();
@@ -298,14 +326,11 @@ export default defineContentScript({
     };
 
     async function hello(): Promise<void> {
-      const url = new URL(location.href);
-      url.search = '';
-      url.hash = '';
       const response = (await browser.runtime.sendMessage({
         type: 'HELLO',
         clientId,
         documentId,
-        url: url.toString(),
+        url: location.href,
       })) as RuntimeResponse;
       if (response.ok) {
         const enabled = 'captureEnabled' in response ? (response.captureEnabled ?? false) : false;
@@ -346,7 +371,7 @@ export default defineContentScript({
       if (!payload || payload.channel !== CHANNEL) return;
       const kind = payload.kind === 'error' ? 'error' : 'console';
       const data = payload.data;
-      if (!data || typeof data !== 'object' || jsonUtf8ByteLength(data) > 32_000) return;
+      if (!data || typeof data !== 'object' || jsonUtf8ByteLength(data) > 1_000_000) return;
       emit({
         observedAt: performance.timeOrigin + performance.now(),
         kind,
@@ -355,6 +380,16 @@ export default defineContentScript({
     });
 
     browser.runtime.onMessage.addListener((message: BackgroundMessage, _sender, sendResponse) => {
+      if (message.type === 'CAPTURE_READY') {
+        if (window !== window.top || message.protocolVersion !== CAPTURE_PROTOCOL_VERSION) return;
+        sendResponse({
+          ready: true,
+          protocolVersion: CAPTURE_PROTOCOL_VERSION,
+          clientId,
+          documentId,
+        });
+        return;
+      }
       if (message.type === 'STATE_CHANGED') {
         void enqueueState(message.state, message.captureEnabled)
           .then(() => {
@@ -434,14 +469,6 @@ export default defineContentScript({
         });
         return true;
       }
-      if (message.type === 'CAPTURE_SCREENSHOT_RECTS') {
-        sendResponse({
-          rects: listSensitiveRects(),
-          devicePixelRatio: window.devicePixelRatio,
-          documentToken: documentId,
-        });
-        return;
-      }
       return;
     });
 
@@ -451,9 +478,11 @@ export default defineContentScript({
   },
 });
 
-function createStatusOverlay(): { update: (state: RecorderViewState) => void; remove: () => void } {
+function createStatusOverlay(
+  label: (state: RecorderViewState) => string,
+): { update: (state: RecorderViewState) => void; remove: () => void } {
   const host = document.createElement('div');
-  host.dataset.bugtraceBlock = 'true';
+  host.dataset.bugtraceOverlay = 'true';
   host.setAttribute('aria-hidden', 'true');
   const shadow = host.attachShadow({ mode: 'closed' });
   const pill = document.createElement('div');
@@ -482,7 +511,7 @@ function createStatusOverlay(): { update: (state: RecorderViewState) => void; re
     update(state) {
       mount();
       pill.dataset.state = state.status;
-      pill.textContent = state.status === 'recording' ? 'Bugtrace · recording' : `Bugtrace · ${state.status}`;
+      pill.textContent = label(state);
     },
     remove() {
       host.remove();

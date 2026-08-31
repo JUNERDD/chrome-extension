@@ -58,7 +58,7 @@ export default defineContentScript({
       post('error', {
         type: 'window.error',
         message: truncate(event.message),
-        source: redactUrl(event.filename),
+        source: truncate(event.filename, 8_192),
         line: event.lineno,
         column: event.colno,
         details: serialize(event.error),
@@ -73,35 +73,49 @@ export default defineContentScript({
   },
 });
 
-function serialize(value: unknown): unknown {
+function serialize(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
   if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
-  if (typeof value === 'string') return redactSecrets(truncate(value));
+  if (typeof value === 'string') return truncate(value, 16_384);
   if (typeof value === 'bigint') return `${value.toString()}n`;
   if (typeof value === 'undefined') return '[undefined]';
   if (typeof value === 'function') return '[Function]';
-  // Any reflection on a page-owned object can execute Proxy traps or accessors and change the
-  // application under test. Object diagnostics are deliberately opaque in safe mode.
-  if (typeof value === 'object') return '[Object]';
+  if (typeof value === 'object') {
+    if (depth >= 5) return '[MaxDepth]';
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+    let descriptors: Record<string, PropertyDescriptor>;
+    try {
+      descriptors = Object.getOwnPropertyDescriptors(value);
+    } catch {
+      return '[Uninspectable]';
+    }
+    if (Array.isArray(value)) {
+      const declaredLength = typeof descriptors.length?.value === 'number'
+        ? descriptors.length.value
+        : 0;
+      const result: unknown[] = [];
+      for (let index = 0; index < Math.min(declaredLength, 200); index += 1) {
+        const descriptor = descriptors[String(index)];
+        result.push(descriptor && 'value' in descriptor
+          ? serialize(descriptor.value, depth + 1, seen)
+          : '[Accessor]');
+      }
+      if (declaredLength > result.length) result.push(`[${declaredLength - result.length} more items]`);
+      return result;
+    }
+    const result: Record<string, unknown> = {};
+    for (const [key, descriptor] of Object.entries(descriptors)
+      .filter(([name, item]) => name !== '__proto__' && item.enumerable)
+      .slice(0, 100)) {
+      result[truncate(key, 1_000)] = 'value' in descriptor
+        ? serialize(descriptor.value, depth + 1, seen)
+        : '[Accessor]';
+    }
+    return result;
+  }
   return truncate(String(value));
 }
 
 function truncate(value: string, maxLength = 2_000): string {
   return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
-}
-
-function redactUrl(value: string): string {
-  try {
-    const url = new URL(value, location.href);
-    url.search = '';
-    url.hash = '';
-    return url.toString();
-  } catch {
-    return '[unavailable]';
-  }
-}
-
-function redactSecrets(value: string): string {
-  return value
-    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [REDACTED]')
-    .replace(/\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]');
 }

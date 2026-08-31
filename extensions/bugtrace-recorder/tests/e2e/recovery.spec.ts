@@ -6,6 +6,7 @@ import {
   launchExtensionContext,
   readState,
   sendCommand,
+  setLanguagePreference,
   waitForExtensionWorker,
 } from './extension.fixture';
 
@@ -16,9 +17,10 @@ test('browser restart exposes an active recording as interrupted', async ({ base
 
   try {
     let worker = await waitForExtensionWorker(context);
+    await setLanguagePreference(worker, 'en');
     const extensionId = new URL(worker.url()).hostname;
     let controlPage = await context.newPage();
-    await controlPage.goto(`chrome-extension://${extensionId}/popup.html`);
+    await controlPage.goto(`chrome-extension://${extensionId}/sidepanel.html`);
     const fixturePage = await context.newPage();
     await fixturePage.goto(`${baseURL}/sensitive`);
 
@@ -32,7 +34,7 @@ test('browser restart exposes an active recording as interrupted', async ({ base
     context = await launchExtensionContext(profileDirectory);
     worker = await waitForExtensionWorker(context);
     controlPage = await context.newPage();
-    await controlPage.goto(`chrome-extension://${new URL(worker.url()).hostname}/popup.html`);
+    await controlPage.goto(`chrome-extension://${new URL(worker.url()).hostname}/sidepanel.html`);
 
     const recovered = await readState(controlPage);
     expect(recovered.ok, recovered.error).toBe(true);

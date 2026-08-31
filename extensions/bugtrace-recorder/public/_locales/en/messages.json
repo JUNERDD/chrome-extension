@@ -1,0 +1,26 @@
+{
+  "appName": {
+    "message": "Bugtrace Recorder",
+    "description": "Extension name"
+  },
+  "appDescription": {
+    "message": "Record local, full-fidelity browser reproductions for bug reports and agents.",
+    "description": "Extension description"
+  },
+  "actionTitle": {
+    "message": "Open Bugtrace Recorder",
+    "description": "Toolbar action title"
+  },
+  "commandRecord": {
+    "message": "Start recording the current tab"
+  },
+  "commandPause": {
+    "message": "Pause the active recording"
+  },
+  "commandResume": {
+    "message": "Resume the paused recording"
+  },
+  "commandStop": {
+    "message": "Stop and review the recording"
+  }
+}

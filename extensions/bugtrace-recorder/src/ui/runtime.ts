@@ -1,12 +1,32 @@
 import { useCallback, useEffect, useState } from 'react';
 import { browser } from 'wxt/browser';
+import { hasRuntimeCapability } from '../messaging';
 import type {
   BackgroundMessage,
   RecorderViewState,
+  RuntimeErrorCode,
   RuntimeRequest,
   RuntimeResponse,
   SessionCommand,
 } from '../messaging';
+
+export interface RecorderRuntimeError {
+  errorCode?: RuntimeErrorCode;
+  message: string;
+}
+
+type RuntimeCompatibility = 'checking' | 'compatible' | 'reload-required';
+
+function runtimeError(response: Extract<RuntimeResponse, { ok: false }>): RecorderRuntimeError {
+  const errorCode =
+    'errorCode' in response && typeof response.errorCode === 'string'
+      ? response.errorCode
+      : undefined;
+  return {
+    ...(errorCode ? { errorCode } : {}),
+    message: response.error,
+  };
+}
 
 export async function sendRuntimeRequest(request: RuntimeRequest): Promise<RuntimeResponse> {
   try {
@@ -27,9 +47,11 @@ function isStateMessage(message: unknown): message is Extract<BackgroundMessage,
 
 export function useRecorderState() {
   const [state, setState] = useState<RecorderViewState | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<RecorderRuntimeError | null>(null);
   const [busyCommand, setBusyCommand] = useState<SessionCommand | null>(null);
   const [receivedAt, setReceivedAt] = useState(0);
+  const [runtimeCompatibility, setRuntimeCompatibility] =
+    useState<RuntimeCompatibility>('checking');
 
   const applyState = useCallback((nextState: RecorderViewState) => {
     setReceivedAt(Date.now());
@@ -40,9 +62,12 @@ export function useRecorderState() {
   const refresh = useCallback(async () => {
     const response = await sendRuntimeRequest({ type: 'GET_STATE' });
     if (response.ok && 'state' in response) {
+      setRuntimeCompatibility(
+        hasRuntimeCapability(response, 'deleteSession') ? 'compatible' : 'reload-required',
+      );
       applyState(response.state);
     } else if (!response.ok) {
-      setError(response.error);
+      setError(runtimeError(response));
     }
   }, [applyState]);
 
@@ -62,16 +87,28 @@ export function useRecorderState() {
       const response = await sendRuntimeRequest({ type: 'SESSION_COMMAND', command: nextCommand });
       setBusyCommand(null);
       if (response.ok && 'state' in response) {
+        setRuntimeCompatibility(
+          hasRuntimeCapability(response, 'deleteSession') ? 'compatible' : 'reload-required',
+        );
         applyState(response.state);
         return true;
       }
-      if (!response.ok) setError(response.error);
+      if (!response.ok) setError(runtimeError(response));
       return false;
     },
     [applyState],
   );
 
-  return { state, error, busyCommand, command, refresh, receivedAt };
+  return {
+    state,
+    error,
+    busyCommand,
+    command,
+    refresh,
+    receivedAt,
+    runtimeHistoryCommandsReady: runtimeCompatibility === 'compatible',
+    runtimeReloadRequired: runtimeCompatibility === 'reload-required',
+  };
 }
 
 export function useLiveDuration(

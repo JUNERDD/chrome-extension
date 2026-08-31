@@ -17,10 +17,10 @@ export function formatBytes(bytes: number): string {
   return `${value >= 10 || exponent === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[exponent]}`;
 }
 
-export function formatDate(value: string | number): string {
+export function formatDate(value: string | number, locale?: string, fallback = 'Unknown'): string {
   const date = typeof value === 'number' ? new Date(value) : new Date(value);
-  if (Number.isNaN(date.valueOf())) return 'Unknown';
-  return new Intl.DateTimeFormat(undefined, {
+  if (Number.isNaN(date.valueOf())) return fallback;
+  return new Intl.DateTimeFormat(locale, {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(date);

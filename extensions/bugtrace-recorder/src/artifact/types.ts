@@ -1,9 +1,13 @@
 export const BUGTRACE_FORMAT = 'bugtrace' as const;
-export const BUGTRACE_FORMAT_VERSION = '1.0.0' as const;
+export const BUGTRACE_FORMAT_VERSION = '1.1.0' as const;
 export const BUGTRACE_BUNDLE_FORMAT = 'bugtrace-bundle' as const;
-export const BUGTRACE_BUNDLE_VERSION = '1.0.0' as const;
+export const BUGTRACE_BUNDLE_VERSION = '1.1.0' as const;
+
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
 export type MissingEvidenceStatus =
+  | 'unavailable'
   | 'redacted'
   | 'omitted'
   | 'unsupported'
@@ -75,12 +79,13 @@ export interface EnvironmentInfo {
 
 export interface PrivacyInfo {
   localOnly: true;
-  inputValues: 'redacted';
-  urlQueryValues: 'redacted';
-  requestBodies: 'omitted';
-  responseBodies: 'omitted';
-  cookies: 'omitted';
-  sensitiveHeaders: 'omitted';
+  captureMode: 'full-fidelity' | 'privacy-filtered';
+  inputValues: 'captured' | 'redacted';
+  urlQueryValues: 'captured' | 'redacted';
+  requestBodies: 'captured' | 'unavailable' | 'omitted';
+  responseBodies: 'captured' | 'unavailable' | 'omitted';
+  cookies: 'captured' | 'unavailable' | 'omitted';
+  sensitiveHeaders: 'captured' | 'unavailable' | 'omitted';
   redactionCount: number;
   redactionCountSemantics: 'minimum_observed';
   warnings: string[];
@@ -153,6 +158,14 @@ export interface RedactedInputInfo {
   lengthBucket?: 'empty' | '1-4' | '5-8' | '9-16' | '17+';
 }
 
+export interface CapturedInputInfo {
+  status: 'captured';
+  inputType: string;
+  value: JsonValue;
+}
+
+export type InputInfo = CapturedInputInfo | RedactedInputInfo;
+
 export type StepAction =
   | 'click'
   | 'double_click'
@@ -177,11 +190,15 @@ export interface ScrollPosition {
 export interface DroppedFileInfo {
   mimeType: string;
   size?: number;
+  name?: string;
+  lastModified?: number;
+  relativePath?: string;
 }
 
 export interface SemanticStep {
   id: string;
   seq: number;
+  sourceSeq?: number;
   offsetMs: number;
   tabId: string;
   frameId?: string;
@@ -189,7 +206,7 @@ export interface SemanticStep {
   action: StepAction;
   target?: TargetDescriptor | MissingEvidence;
   observation?: UntrustedObservation | MissingEvidence;
-  input?: RedactedInputInfo;
+  input?: InputInfo;
   key?: string;
   modifiers?: ModifierKey[];
   mouseButton?: 0 | 1 | 2 | 3 | 4;
@@ -212,6 +229,7 @@ export type NavigationOutcome = 'pending' | 'completed' | 'failed';
 export interface NavigationRecord {
   id: string;
   seq: number;
+  sourceSeq?: number;
   offsetMs: number;
   tabId: string;
   frameId?: string;
@@ -227,6 +245,7 @@ export interface NavigationRecord {
 export interface ConsoleRecord {
   id: string;
   seq: number;
+  sourceSeq?: number;
   offsetMs: number;
   tabId: string;
   frameId?: string;
@@ -238,23 +257,49 @@ export interface ConsoleRecord {
 export interface NetworkRecord {
   id: string;
   seq: number;
+  sourceSeq?: number;
   offsetMs: number;
   tabId: string;
   method: string;
   url: string;
   resourceType: string;
   outcome: 'completed' | 'failed' | 'redirected';
+  requestId?: string;
+  initiator?: NetworkInitiator;
   statusCode?: number;
   durationMs?: number;
   fromCache?: boolean;
   contentType?: string | MissingEvidence;
   encodedSize?: number | MissingEvidence;
+  requestHeaders?: CapturedValue | MissingEvidence;
+  responseHeaders?: CapturedValue | MissingEvidence;
+  requestBody?: CapturedValue | MissingEvidence;
+  responseBody?: CapturedValue | MissingEvidence;
   error?: UntrustedObservation | MissingEvidence;
+}
+
+export type NetworkInitiator =
+  | {
+      status: 'linked';
+      stepId: string;
+      relation: 'temporal-predecessor';
+      deltaMs: number;
+    }
+  | {
+      status: 'unavailable';
+      reason: string;
+    };
+
+export interface CapturedValue {
+  status: 'captured';
+  value: JsonValue;
+  encoding?: string;
 }
 
 export interface ErrorRecord {
   id: string;
   seq: number;
+  sourceSeq?: number;
   offsetMs: number;
   tabId: string;
   frameId?: string;
@@ -267,6 +312,7 @@ export interface ErrorRecord {
 interface ScreenshotRecordBase {
   id: string;
   seq: number;
+  sourceSeq?: number;
   offsetMs: number;
   tabId: string;
   trigger: 'manual' | 'error' | 'navigation' | 'stop';
@@ -297,6 +343,8 @@ interface RrwebSegmentRecordBase {
   frameId?: string;
   startSeq: number;
   endSeq: number;
+  sourceStartSeq?: number;
+  sourceEndSeq?: number;
   startedAtOffsetMs: number;
   endedAtOffsetMs: number;
   eventCount: number;
@@ -333,8 +381,10 @@ export type CaptureGapSource =
 export interface CaptureGap {
   id: string;
   seq: number;
+  sourceSeq?: number;
   offsetMs: number;
   source: CaptureGapSource;
+  affectedSources?: CaptureGapSource[];
   status: MissingEvidenceStatus;
   reason: string;
   tabId?: string;
@@ -409,7 +459,7 @@ export interface BundleResourceInput {
   data: ArtifactEntryData;
   mimeType: string;
   purpose: Exclude<BundleEntryPurpose, 'trace' | 'schema' | 'report'>;
-  relatedId?: string;
+  relatedId: string;
 }
 
 export interface BundleManifestEntry {
@@ -446,4 +496,20 @@ export interface BuiltBugtraceZip {
   report: string;
   trace: BugtraceTrace;
   filename: string;
+}
+
+export interface BugtraceZipVerificationLimits {
+  maxArchiveBytes?: number;
+  maxEntries?: number;
+  maxEntryUncompressedBytes?: number;
+  maxTotalUncompressedBytes?: number;
+  maxCompressionRatio?: number;
+}
+
+export interface VerifiedBugtraceZip {
+  manifest: BugtraceBundleManifest;
+  trace: BugtraceTrace;
+  report: string;
+  entryCount: number;
+  totalUncompressedBytes: number;
 }

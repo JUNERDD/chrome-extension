@@ -1,26 +1,38 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Alert,
+  Button,
+  Card,
+  Chip,
+  Description,
+  Kbd,
+  Label,
+  ListBox,
+  Select,
+  Spinner,
+  Typography,
+} from '@heroui/react';
+import { useCallback, useEffect, useMemo, useState, type PropsWithChildren } from 'react';
 import { browser } from 'wxt/browser';
-import type { RuntimeResponse, SessionCommand } from '../../src/messaging';
+import {
+  resolveLocale,
+  translateMessage,
+  useI18n,
+  type LanguagePreference,
+} from '../../src/i18n';
+import { hasRuntimeCapability } from '../../src/messaging';
+import type { SessionCommand } from '../../src/messaging';
 import {
   cleanupExpiredSessions,
-  deleteSession,
   listAssets,
   listEvents,
   listSessions,
   loadCurrentSessionState,
   type StoredSession,
 } from '../../src/storage';
-import {
-  Brand,
-  InstrumentButton,
-  LoadingPlate,
-  Notice,
-  Reading,
-  SectionHeading,
-  StatusBeacon,
-} from '../../src/ui/components';
+import { Brand } from '../../src/ui/components';
 import { compactShortcut, formatBytes, formatDate } from '../../src/ui/format';
 import { Icon } from '../../src/ui/icons';
+import { sendRuntimeRequest } from '../../src/ui/runtime';
 
 type CommandName = Extract<SessionCommand, 'record' | 'pause' | 'resume' | 'stop'>;
 
@@ -33,21 +45,10 @@ interface CommandBinding {
 interface RetentionSnapshot {
   sessions: Array<StoredSession<Record<string, unknown>>>;
   totalBytes: number;
-  eventCount: number;
-  assetCount: number;
-  currentSessionId: string | null;
   activeSessionId: string | null;
-  quotaUsage: number | null;
-  quota: number | null;
 }
 
 const COMMAND_ORDER: readonly CommandName[] = ['record', 'pause', 'resume', 'stop'];
-const COMMAND_LABEL: Record<CommandName, string> = {
-  record: 'Start recording',
-  pause: 'Pause capture',
-  resume: 'Continue capture',
-  stop: 'Stop and review',
-};
 
 function objectString(value: unknown, key: string): string | null {
   if (typeof value !== 'object' || value === null) return null;
@@ -56,19 +57,14 @@ function objectString(value: unknown, key: string): string | null {
 }
 
 async function measureRetention(): Promise<RetentionSnapshot> {
-  const [sessions, currentState, estimate] = await Promise.all([
+  const [sessions, currentState] = await Promise.all([
     listSessions<Record<string, unknown>>(),
     loadCurrentSessionState<Record<string, unknown>>(),
-    navigator.storage.estimate().catch(() => ({ usage: undefined, quota: undefined })),
   ]);
 
   let totalBytes = 0;
-  let eventCount = 0;
-  let assetCount = 0;
   for (const session of sessions) {
     const [events, assets] = await Promise.all([listEvents(session.id), listAssets(session.id)]);
-    eventCount += events.length;
-    assetCount += assets.length;
     totalBytes += assets.reduce((sum, asset) => sum + asset.bytes.byteLength, 0);
     totalBytes += new TextEncoder().encode(JSON.stringify(events)).byteLength;
   }
@@ -79,44 +75,77 @@ async function measureRetention(): Promise<RetentionSnapshot> {
   return {
     sessions,
     totalBytes,
-    eventCount,
-    assetCount,
-    currentSessionId,
     activeSessionId: currentStatus && activeStatuses.has(currentStatus) ? currentSessionId : null,
-    quotaUsage: estimate.usage ?? null,
-    quota: estimate.quota ?? null,
   };
 }
 
+function isLanguagePreference(value: unknown): value is LanguagePreference {
+  return value === 'system' || value === 'en' || value === 'zh-CN';
+}
+
 export function OptionsApp() {
+  const {
+    t,
+    locale,
+    ready,
+    languagePreference,
+    setLanguagePreference,
+    systemLanguage,
+  } = useI18n();
   const [commands, setCommands] = useState<CommandBinding[] | null>(null);
   const [retention, setRetention] = useState<RetentionSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [languageBusy, setLanguageBusy] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState(false);
+  const [runtimeHistoryCommandsReady, setRuntimeHistoryCommandsReady] = useState(false);
+  const [runtimeReloadRequired, setRuntimeReloadRequired] = useState(false);
+
+  const commandLabel = useCallback(
+    (name: CommandName) => t(`settings.shortcuts.command.${name}.label`),
+    [t],
+  );
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const [commandList, snapshot] = await Promise.all([browser.commands.getAll(), measureRetention()]);
+      const [commandList, snapshot, runtimeResponse] = await Promise.all([
+        browser.commands.getAll(),
+        measureRetention(),
+        sendRuntimeRequest({ type: 'GET_STATE' }),
+      ]);
       const byName = new Map(commandList.map((item) => [item.name, item]));
       setCommands(
         COMMAND_ORDER.map((name) => ({
           name,
-          description: byName.get(name)?.description ?? COMMAND_LABEL[name],
+          description: t(`settings.shortcuts.command.${name}.detail`),
           shortcut: byName.get(name)?.shortcut ?? '',
         })),
       );
       setRetention(snapshot);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Unable to read recorder settings.');
+      const runtimeIsCurrent = runtimeResponse.ok &&
+        hasRuntimeCapability(runtimeResponse, 'deleteSession');
+      setRuntimeHistoryCommandsReady(runtimeIsCurrent);
+      setRuntimeReloadRequired(runtimeResponse.ok && !runtimeIsCurrent);
+      if (!runtimeResponse.ok) setError(t('settings.alert.error.detail'));
+    } catch {
+      setError(t('settings.alert.error.detail'));
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
+    document.documentElement.lang = locale;
+    document.title = `${t('settings.title')} — ${t('common.appName')}`;
+  }, [locale, t]);
+
+  useEffect(() => {
+    if (!ready) return undefined;
     queueMicrotask(() => void refresh());
-  }, [refresh]);
+    const handleFocus = () => void refresh();
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [ready, refresh]);
 
   useEffect(() => {
     if (!deleteArmed) return undefined;
@@ -124,13 +153,41 @@ export function OptionsApp() {
     return () => window.clearTimeout(timer);
   }, [deleteArmed]);
 
-  const unbound = useMemo(() => commands?.filter((command) => !command.shortcut).length ?? 0, [commands]);
+  const unbound = useMemo(
+    () => commands?.filter((command) => !command.shortcut).length ?? 0,
+    [commands],
+  );
+  const latestSession = useMemo(
+    () => retention?.sessions.reduce<StoredSession<Record<string, unknown>> | null>(
+      (latest, session) => !latest || session.updatedAt > latest.updatedAt ? session : latest,
+      null,
+    ) ?? null,
+    [retention],
+  );
+  const deletableCount = useMemo(
+    () => retention?.sessions.filter((session) => session.id !== retention.activeSessionId).length ?? 0,
+    [retention],
+  );
 
   const openShortcutManager = async () => {
     try {
       await browser.tabs.create({ url: 'chrome://extensions/shortcuts' });
     } catch {
-      setError('Chrome blocked the shortcuts page. Open chrome://extensions/shortcuts manually.');
+      setError(t('settings.shortcuts.openManagerError'));
+    }
+  };
+
+  const changeLanguage = async (preference: LanguagePreference) => {
+    setLanguageBusy(true);
+    setError(null);
+    try {
+      await setLanguagePreference(preference);
+      const nextLocale = resolveLocale(preference, systemLanguage);
+      setNotice(translateMessage(nextLocale, 'settings.language.saved'));
+    } catch {
+      setError(t('settings.language.saveFailed'));
+    } finally {
+      setLanguageBusy(false);
     }
   };
 
@@ -139,16 +196,24 @@ export function OptionsApp() {
     setError(null);
     try {
       const deleted = await cleanupExpiredSessions();
-      setNotice(deleted.length ? `Removed ${deleted.length} expired session${deleted.length === 1 ? '' : 's'}.` : 'No expired sessions found.');
+      setNotice(
+        deleted.length
+          ? t('settings.storage.expiredRemoved', { count: deleted.length })
+          : t('settings.storage.expiredNone'),
+      );
       await refresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Expired session cleanup failed.');
+    } catch {
+      setError(t('settings.storage.cleanupFailed'));
     } finally {
       setBusy(false);
     }
   };
 
   const deleteRetained = async () => {
+    if (!runtimeHistoryCommandsReady) {
+      if (runtimeReloadRequired) setError(t('settings.storage.runtimeOutdated.detail'));
+      return;
+    }
     if (!deleteArmed) {
       setDeleteArmed(true);
       return;
@@ -158,216 +223,319 @@ export function OptionsApp() {
     setError(null);
     try {
       const deletable = retention.sessions.filter((session) => session.id !== retention.activeSessionId);
-      const deletesCurrentCompleted =
-        retention.currentSessionId !== null &&
-        retention.activeSessionId === null &&
-        deletable.some((session) => session.id === retention.currentSessionId);
-      if (deletesCurrentCompleted) {
-        const response = (await browser.runtime.sendMessage({
-          type: 'SESSION_COMMAND',
-          command: 'discard',
-        })) as RuntimeResponse;
-        if (!response.ok) throw new Error(response.error);
-      }
-      await Promise.all(
-        deletable
-          .filter((session) => !deletesCurrentCompleted || session.id !== retention.currentSessionId)
-          .map((session) => deleteSession(session.id)),
+      const responses = await Promise.all(
+        deletable.map((session) => sendRuntimeRequest({
+          type: 'DELETE_SESSION',
+          sessionId: session.id,
+        })),
       );
+      const rejection = responses.find((response) => !response.ok);
+      if (rejection && !rejection.ok) throw new Error(rejection.error);
       setNotice(
         retention.activeSessionId
-          ? `Removed ${deletable.length} retained session${deletable.length === 1 ? '' : 's'}; the active recording was protected.`
-          : `Removed ${deletable.length} retained session${deletable.length === 1 ? '' : 's'}.`,
+          ? t('settings.storage.deletedProtected', { count: deletable.length })
+          : t('settings.storage.deleted', { count: deletable.length }),
       );
       setDeleteArmed(false);
       await refresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Local data deletion failed.');
+    } catch {
+      setError(t('settings.storage.deleteFailed'));
     } finally {
       setBusy(false);
     }
   };
 
+  if (!ready) {
+    return (
+      <main className="grid min-h-screen place-items-center bg-background px-4 text-foreground">
+        <div className="flex items-center gap-3" role="status">
+          <Spinner size="sm" aria-label={t('common.loading')} />
+          <Typography.Paragraph color="muted" size="sm">
+            {t('common.loading')}
+          </Typography.Paragraph>
+        </div>
+      </main>
+    );
+  }
+
   return (
-    <main className="options-shell">
-      <header className="options-masthead">
-        <Brand />
-        <div className="options-masthead__meta">
-          <StatusBeacon label="Local instrument" tone="success" />
-          <span className="mono">CONFIG / V0.1</span>
+    <div className="min-h-screen bg-background text-foreground">
+      <header className="sticky top-0 z-20 border-b border-separator bg-background">
+        <div className="mx-auto flex min-h-16 w-full max-w-5xl items-center justify-between gap-4 px-4 sm:px-6">
+          <Brand label={t('common.appName')} />
+          <Chip color="success" size="sm" variant="soft">
+            <Chip.Label>{t('common.localOnly')}</Chip.Label>
+          </Chip>
         </div>
       </header>
 
-      <section className="options-intro">
-        <span className="eyebrow mono">FLIGHT RECORDER CONFIGURATION</span>
-        <h1>Visible controls.<br /><em>Fixed privacy rails.</em></h1>
-        <p>
-          Bugtrace records a scoped browser reproduction for testers and agents. Capture remains local;
-          privacy-critical omissions cannot be disabled here.
-        </p>
-      </section>
+      <main className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6 sm:py-12">
+        <header className="max-w-2xl">
+          <Typography className="font-mono text-accent" type="body-xs" weight="medium">
+            {t('settings.eyebrow')}
+          </Typography>
+          <Typography.Heading className="mt-2" level={1}>
+            {t('settings.title')}
+          </Typography.Heading>
+          <Typography.Paragraph className="mt-3" color="muted" size="sm">
+            {t('settings.description')}
+          </Typography.Paragraph>
+        </header>
 
-      {error && (
-        <div className="options-alert">
-          <Notice tone="danger" title="Configuration readout error">{error}</Notice>
-        </div>
-      )}
-      {notice && (
-        <div className="options-alert">
-          <Notice tone="success" title="Local maintenance complete">{notice}</Notice>
-        </div>
-      )}
-
-      <div className="options-grid">
-        <section className="options-panel options-panel--commands">
-          <SectionHeading index="01" aside={commands ? `${4 - unbound}/4 assigned` : 'reading'}>
-            Command bindings
-          </SectionHeading>
-          {!commands ? (
-            <LoadingPlate label="Reading Chrome commands…" />
-          ) : (
-            <>
-              <div className="command-list">
-                {commands.map((command, index) => (
-                  <div className="command-row" key={command.name}>
-                    <span className="command-row__number mono">{String(index + 1).padStart(2, '0')}</span>
-                    <div>
-                      <strong>{COMMAND_LABEL[command.name]}</strong>
-                      <small>{command.description}</small>
-                    </div>
-                    <kbd className={command.shortcut ? '' : 'command-row__unbound'}>
-                      {compactShortcut(command.shortcut)}
-                    </kbd>
-                  </div>
-                ))}
-              </div>
-              {unbound > 0 && (
-                <Notice title={`${unbound} command${unbound === 1 ? '' : 's'} need a binding`}>
-                  Chrome owns extension shortcuts. Assign missing keys and resolve any conflicts in its shortcut manager.
-                </Notice>
-              )}
-              <InstrumentButton icon="arrow-up-right" intent="primary" onClick={() => void openShortcutManager()}>
-                Open Chrome shortcut manager
-              </InstrumentButton>
-              <p className="manual-route mono">FALLBACK ROUTE · chrome://extensions/shortcuts</p>
-            </>
-          )}
-        </section>
-
-        <section className="options-panel options-panel--privacy">
-          <SectionHeading index="02" aside="non-negotiable">
-            Privacy boundary
-          </SectionHeading>
-          <div className="rail-list">
-            <PrivacyRail code="LOCAL" title="Device-only evidence" detail="No telemetry, upload, cloud sync, or clipboard reading." />
-            <PrivacyRail code="MASK" title="All input values redacted" detail="Type and coarse length may remain; entered values never do." />
-            <PrivacyRail code="META" title="Network metadata only" detail="No request or response body, cookie, Authorization, or sensitive header." />
-            <PrivacyRail code="SAFE" title="Untrusted page evidence" detail="Page text is escaped and labelled so agents never treat it as instruction." />
-          </div>
-        </section>
-
-        <section className="options-panel options-panel--permissions">
-          <SectionHeading index="03" aside="manifest v3">
-            Permission ledger
-          </SectionHeading>
-          <div className="permission-table">
-            <PermissionRow name="activeTab" use="User-authorized, redacted viewport screenshots" />
-            <PermissionRow name="storage" use="Resumable state and local evidence log" />
-            <PermissionRow name="webNavigation" use="Document, SPA, hash, and history transitions" />
-            <PermissionRow name="webRequest" use="Redacted timing/status metadata; no body access" />
-            <PermissionRow name="http(s)://*/*" use="Dormant recorder on approved in-scope pages" warning />
-          </div>
-          <Notice tone="info" title="Explicit exclusions">
-            No debugger, downloads, unlimitedStorage, clipboard, incognito, file://, browser UI, or OS-level capture.
-          </Notice>
-        </section>
-
-        <section className="options-panel options-panel--retention">
-          <SectionHeading index="04" aside="local maintenance">
-            Retention & capacity
-          </SectionHeading>
-          {!retention ? (
-            <LoadingPlate label="Measuring retained evidence…" />
-          ) : (
-            <>
-              <div className="retention-readings">
-                <Reading label="Sessions" value={retention.sessions.length.toString().padStart(2, '0')} />
-                <Reading label="Measured evidence" value={formatBytes(retention.totalBytes)} />
-                <Reading label="Objects" value={(retention.eventCount + retention.assetCount).toLocaleString()} />
-              </div>
-              <div className="capacity-meter" aria-label="Browser storage utilization">
-                <div>
-                  <span>Browser storage estimate</span>
-                  <strong className="mono">
-                    {retention.quotaUsage === null ? 'UNAVAILABLE' : formatBytes(retention.quotaUsage)}
-                    {retention.quota === null ? '' : ` / ${formatBytes(retention.quota)}`}
-                  </strong>
-                </div>
-                <span className="capacity-meter__track">
-                  <i
-                    style={{
-                      width: `${retention.quota && retention.quotaUsage ? Math.min(100, (retention.quotaUsage / retention.quota) * 100) : 0}%`,
-                    }}
-                  />
-                </span>
-              </div>
-              <dl className="retention-rules">
-                <div><dt>Default TTL</dt><dd>24 hours from last activity</dd></div>
-                <div><dt>Target bundle</dt><dd>&lt; 10 MiB</dd></div>
-                <div><dt>Capacity warning</dt><dd>25 MiB</dd></div>
-                <div><dt>Evidence hard rail</dt><dd>50 MiB; semantic core retained</dd></div>
-                {retention.sessions.at(-1) && (
-                  <div><dt>Latest local update</dt><dd>{formatDate(retention.sessions.at(-1)?.updatedAt ?? '')}</dd></div>
-                )}
-              </dl>
-              <div className="maintenance-actions">
-                <InstrumentButton icon="refresh" disabled={busy} onClick={() => void cleanExpired()}>
-                  Remove expired
-                </InstrumentButton>
-                <InstrumentButton
-                  icon="erase"
-                  intent={deleteArmed ? 'danger' : 'quiet'}
-                  disabled={busy || retention.sessions.length === 0}
-                  onClick={() => void deleteRetained()}
+        {(error || notice || runtimeReloadRequired) && (
+          <div className="mt-6 grid gap-3">
+            {error && (
+              <SettingsAlert status="danger" title={t('settings.alert.error.title')}>
+                {error}
+              </SettingsAlert>
+            )}
+            {notice && (
+              <SettingsAlert status="success" title={t('settings.alert.maintenance.title')}>
+                {notice}
+              </SettingsAlert>
+            )}
+            {runtimeReloadRequired && (
+              <div className="grid gap-2">
+                <SettingsAlert
+                  status="warning"
+                  title={t('settings.storage.runtimeOutdated.title')}
                 >
-                  {deleteArmed ? 'Confirm deletion' : 'Delete retained data'}
-                </InstrumentButton>
+                  {t('settings.storage.runtimeOutdated.detail')}
+                </SettingsAlert>
+                <Button variant="secondary" onPress={() => browser.runtime.reload()}>
+                  <Icon name="refresh" size={16} />
+                  {t('settings.storage.runtimeOutdated.action')}
+                </Button>
               </div>
-              {retention.activeSessionId && (
-                <p className="active-protection mono">
-                  <Icon name="shield" size={13} /> ACTIVE SESSION {retention.activeSessionId.slice(0, 8)}… IS PROTECTED
-                </p>
+            )}
+          </div>
+        )}
+
+        <div className="mt-8 grid gap-4">
+          <Card aria-labelledby="language-heading">
+            <Card.Header className="gap-1">
+              <Card.Title
+                id="language-heading"
+                render={(props) => <h2 {...props} />}
+              >
+                {t('settings.language.heading')}
+              </Card.Title>
+              <Card.Description>{t('settings.language.description')}</Card.Description>
+            </Card.Header>
+            <Card.Content className="max-w-lg">
+              <Select
+                fullWidth
+                isDisabled={languageBusy}
+                value={languagePreference}
+                onChange={(value) => {
+                  if (isLanguagePreference(value)) void changeLanguage(value);
+                }}
+              >
+                <Label>{t('settings.language.label')}</Label>
+                <Select.Trigger>
+                  <Select.Value />
+                  <Select.Indicator />
+                </Select.Trigger>
+                {languagePreference === 'system' && (
+                  <Description>{t('settings.language.systemDetail', { language: systemLanguage })}</Description>
+                )}
+                <Select.Popover>
+                  <ListBox>
+                    <ListBox.Item id="system" textValue={t('settings.language.system')}>
+                      <Label>{t('settings.language.system')}</Label>
+                      <ListBox.ItemIndicator />
+                    </ListBox.Item>
+                    <ListBox.Item id="en" textValue={t('settings.language.en')}>
+                      <Label>{t('settings.language.en')}</Label>
+                      <ListBox.ItemIndicator />
+                    </ListBox.Item>
+                    <ListBox.Item id="zh-CN" textValue={t('settings.language.zhCN')}>
+                      <Label>{t('settings.language.zhCN')}</Label>
+                      <ListBox.ItemIndicator />
+                    </ListBox.Item>
+                  </ListBox>
+                </Select.Popover>
+              </Select>
+            </Card.Content>
+          </Card>
+
+          <Card aria-labelledby="shortcuts-heading">
+            <Card.Header className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="grid gap-1">
+                <Card.Title
+                  id="shortcuts-heading"
+                  render={(props) => <h2 {...props} />}
+                >
+                  {t('settings.shortcuts.heading')}
+                </Card.Title>
+                <Card.Description>{t('settings.shortcuts.description')}</Card.Description>
+              </div>
+              <Chip color={unbound > 0 ? 'warning' : 'success'} size="sm" variant="soft">
+                <Chip.Label>
+                  {commands
+                    ? t('settings.shortcuts.assigned', { assigned: COMMAND_ORDER.length - unbound })
+                    : t('settings.shortcuts.loading')}
+                </Chip.Label>
+              </Chip>
+            </Card.Header>
+            <Card.Content className="gap-3">
+              {!commands ? (
+                <LoadingRow label={t('settings.shortcuts.loading')} />
+              ) : (
+                <div className="grid gap-2">
+                  {commands.map((command) => (
+                    <Card key={command.name} variant="secondary">
+                      <Card.Content className="flex-row items-center justify-between gap-4">
+                        <div className="min-w-0">
+                          <Card.Title>{commandLabel(command.name)}</Card.Title>
+                          <Card.Description>{command.description}</Card.Description>
+                        </div>
+                        <Kbd>
+                          {command.shortcut
+                            ? compactShortcut(command.shortcut)
+                            : t('common.unbound')}
+                        </Kbd>
+                      </Card.Content>
+                    </Card>
+                  ))}
+                </div>
               )}
-            </>
-          )}
-        </section>
-      </div>
+            </Card.Content>
+            <Card.Footer className="flex-col items-stretch gap-3 sm:flex-row sm:justify-between">
+              {unbound > 0 && (
+                <Chip color="warning" variant="soft">
+                  <Icon name="warning" size={15} />
+                  <Chip.Label>{t('settings.shortcuts.unbound', { count: unbound })}</Chip.Label>
+                </Chip>
+              )}
+              <Button
+                variant="primary"
+                {...(unbound === 0 ? { className: 'sm:ml-auto' } : {})}
+                onPress={() => void openShortcutManager()}
+              >
+                {t('settings.shortcuts.openManager')}
+                <Icon name="arrow-up-right" size={16} />
+              </Button>
+            </Card.Footer>
+          </Card>
 
-      <footer className="options-footer mono">
-        <span>BUGTRACE RECORDER</span>
-        <span>LOCAL EVIDENCE SYSTEM</span>
-        <span>SETTINGS ARE SAVED BY CHROME</span>
-      </footer>
-    </main>
-  );
-}
+          <Card aria-labelledby="storage-heading">
+            <Card.Header className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="grid gap-1">
+                <Card.Title
+                  id="storage-heading"
+                  render={(props) => <h2 {...props} />}
+                >
+                  {t('settings.storage.heading')}
+                </Card.Title>
+                <Card.Description>{t('settings.storage.intro')}</Card.Description>
+              </div>
+              {retention?.activeSessionId && (
+                <Chip color="success" size="sm" variant="soft">
+                  <Chip.Label>{t('settings.storage.activeProtected')}</Chip.Label>
+                </Chip>
+              )}
+            </Card.Header>
+            <Card.Content className="gap-3">
+              {!retention ? (
+                <LoadingRow label={t('settings.storage.loading')} />
+              ) : (
+                <dl
+                  className="grid gap-2 sm:grid-cols-3"
+                  aria-label={t('settings.storage.heading')}
+                >
+                  <MetricCard
+                    label={t('settings.storage.sessions')}
+                    value={retention.sessions.length.toLocaleString(locale)}
+                  />
+                  <MetricCard
+                    label={t('settings.storage.measured')}
+                    value={formatBytes(retention.totalBytes)}
+                  />
+                  <MetricCard
+                    label={t('settings.storage.rule.latest')}
+                    value={latestSession
+                      ? formatDate(latestSession.updatedAt, locale, t('common.unavailable'))
+                      : t('common.unavailable')}
+                  />
+                </dl>
+              )}
+            </Card.Content>
+            <Card.Footer className="flex-col items-stretch gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+              <Button variant="ghost" isDisabled={busy} onPress={() => void refresh()}>
+                <Icon name="refresh" size={16} />
+                {t('common.refresh')}
+              </Button>
+              <Button variant="secondary" isDisabled={busy} onPress={() => void cleanExpired()}>
+                {t('settings.storage.cleanup')}
+              </Button>
+              <Button
+                variant={deleteArmed ? 'danger' : 'danger-soft'}
+                isDisabled={
+                  busy || !runtimeHistoryCommandsReady || !retention || deletableCount === 0
+                }
+                onPress={() => void deleteRetained()}
+              >
+                <Icon name="erase" size={16} />
+                {deleteArmed ? t('settings.storage.confirmDelete') : t('settings.storage.delete')}
+              </Button>
+            </Card.Footer>
+          </Card>
+        </div>
 
-function PrivacyRail({ code, title, detail }: { code: string; title: string; detail: string }) {
-  return (
-    <div className="privacy-rail">
-      <span className="privacy-rail__code mono">{code}</span>
-      <div><strong>{title}</strong><p>{detail}</p></div>
-      <Icon name="check" size={17} />
+        <footer className="flex flex-col gap-2 py-8 sm:flex-row sm:items-center sm:justify-between">
+          <Typography.Paragraph color="muted" size="xs">
+            {t('settings.footer')}
+          </Typography.Paragraph>
+          <Typography className="font-mono" color="muted" type="body-xs">
+            V{browser.runtime.getManifest().version}
+          </Typography>
+        </footer>
+      </main>
     </div>
   );
 }
 
-function PermissionRow({ name, use, warning = false }: { name: string; use: string; warning?: boolean }) {
+function SettingsAlert({
+  children,
+  status,
+  title,
+}: PropsWithChildren<{ status: 'danger' | 'success' | 'warning'; title: string }>) {
   return (
-    <div className="permission-row">
-      <code>{name}</code>
-      <span>{use}</span>
-      <span className={warning ? 'permission-row__host' : ''}>{warning ? 'HOST' : 'API'}</span>
+    <Alert
+      status={status}
+      {...(status === 'danger'
+        ? { role: 'alert' as const }
+        : { role: 'status' as const, 'aria-live': 'polite' as const })}
+    >
+      <Alert.Indicator />
+      <Alert.Content>
+        <Alert.Title>{title}</Alert.Title>
+        <Alert.Description>{children}</Alert.Description>
+      </Alert.Content>
+    </Alert>
+  );
+}
+
+function LoadingRow({ label }: { label: string }) {
+  return (
+    <div className="flex min-h-24 items-center justify-center gap-3" role="status">
+      <Spinner size="sm" />
+      <Typography.Paragraph color="muted" size="sm">{label}</Typography.Paragraph>
     </div>
+  );
+}
+
+function MetricCard({ label, value }: { label: string; value: string }) {
+  return (
+    <Card variant="secondary">
+      <Card.Description render={(props) => <dt {...props} />}>{label}</Card.Description>
+      <Card.Title
+        className="break-words font-mono"
+        render={(props) => <dd {...props} />}
+      >
+        {value}
+      </Card.Title>
+    </Card>
   );
 }

@@ -1,6 +1,5 @@
 import JSZip from 'jszip';
 import { readFile } from 'node:fs/promises';
-import type { Worker } from '@playwright/test';
 import {
   expect,
   readState,
@@ -40,23 +39,7 @@ const sentinels = {
   openShadow: 'BUGTRACE_SENTINEL_OPEN_SHADOW_4ac2',
 } as const;
 
-async function readSensitiveRects(
-  worker: Worker,
-  targetUrl: string,
-): Promise<{ rects: Array<{ x: number; y: number; width: number; height: number }> }> {
-  return worker.evaluate(async (url) => {
-    const tabs = await chrome.tabs.query({});
-    const tab = tabs.find((candidate) => candidate.url === url);
-    if (tab?.id === undefined) throw new Error(`Fixture tab not found for ${url}`);
-    return chrome.tabs.sendMessage(
-      tab.id,
-      { type: 'CAPTURE_SCREENSHOT_RECTS' },
-      { frameId: 0 },
-    ) as Promise<{ rects: Array<{ x: number; y: number; width: number; height: number }> }>;
-  }, targetUrl);
-}
-
-test('recording lifecycle stores redacted evidence and excludes paused input', async ({
+test('recording lifecycle stores full-fidelity evidence and pauses semantic events', async ({
   baseURL,
   controlPage,
   extensionContext,
@@ -65,9 +48,6 @@ test('recording lifecycle stores redacted evidence and excludes paused input', a
   const page = await extensionContext.newPage();
   await page.goto(`${baseURL}/sensitive?token=${sentinels.query}`);
   await expect(page.getByRole('heading', { name: 'Controlled privacy fixture' })).toBeVisible();
-  const sensitiveRects = await readSensitiveRects(extensionWorker, page.url());
-  expect(sensitiveRects.rects.some((rect) => rect.width === 257 && rect.height === 61)).toBe(true);
-  expect(sensitiveRects.rects.some((rect) => rect.width === 233 && rect.height === 53)).toBe(true);
 
   const started = await sendCommand(controlPage, 'record');
   expect(started.ok, started.error).toBe(true);
@@ -109,6 +89,9 @@ test('recording lifecycle stores redacted evidence and excludes paused input', a
   await page.getByRole('button', { name: 'Submit fixture' }).click();
   await expect(page.getByText('submitted')).toBeVisible();
 
+  const screenshot = await sendCommand(controlPage, 'screenshot');
+  expect(screenshot.ok, screenshot.error).toBe(true);
+
   const resultsPagePromise = extensionContext.waitForEvent('page', {
     predicate: (candidate) => candidate.url().includes('/results.html?session='),
   });
@@ -125,22 +108,29 @@ test('recording lifecycle stores redacted evidence and excludes paused input', a
   const evidence = await readStoredEvidence(extensionWorker);
   expect(evidence.sessions).toHaveLength(1);
   expect(evidence.events.length).toBeGreaterThan(4);
+  expect(evidence.assets.length).toBeGreaterThan(0);
+  expect(evidence.assets.every((asset) => asset.mimeType === 'image/png')).toBe(true);
 
   const semanticFills = evidence.events.filter((event) => {
     if (event.kind !== 'semantic' || typeof event.data !== 'object' || event.data === null) return false;
     return (event.data as { action?: unknown }).action === 'fill';
   });
-  expect(JSON.stringify(semanticFills)).toContain('password');
-  expect(JSON.stringify(semanticFills)).not.toContain('paused-value');
+  const serializedFills = JSON.stringify(semanticFills);
+  expect(serializedFills).toContain('password');
+  expect(serializedFills).toContain(sentinels.password);
+  expect(serializedFills).toContain(sentinels.otp);
+  expect(serializedFills).toContain(sentinels.token);
+  expect(serializedFills).not.toContain('paused-value');
+  expect(serializedFills).not.toContain(sentinels.paused);
 
   const serializedEvidence = JSON.stringify(evidence);
   for (const sentinel of Object.values(sentinels)) {
-    expect(serializedEvidence, `stored evidence leaked ${sentinel}`).not.toContain(sentinel);
+    expect(serializedEvidence, `stored evidence omitted ${sentinel}`).toContain(sentinel);
   }
-
-  expect(serializedEvidence).toContain('"state":"redacted"');
-  expect(serializedEvidence).toContain('"requestBody":{"state":"omitted"}');
-  expect(serializedEvidence).toContain('<redacted>');
+  expect(serializedEvidence).toContain('"state":"captured"');
+  expect(serializedEvidence).toContain(sentinels.query);
+  expect(serializedEvidence).toContain(sentinels.network);
+  expect(serializedEvidence).not.toContain('<redacted>');
 
   const downloadPromise = resultsPage.waitForEvent('download', { timeout: 20_000 });
   await resultsPage.getByRole('button', { name: 'Download .bugtrace.zip', exact: true }).click();
@@ -157,6 +147,7 @@ test('recording lifecycle stores redacted evidence and excludes paused input', a
       'trace.json',
       'schema/bugtrace-v1.schema.json',
       'attachments/lifecycle.json',
+      'screenshots/shot-0001.png',
     ]),
   );
   const exportedText = (
@@ -166,9 +157,28 @@ test('recording lifecycle stores redacted evidence and excludes paused input', a
         .map((entry) => entry.async('string')),
     )
   ).join('\n');
+  const exportedRrweb = (
+    await Promise.all(
+      Object.values(zip.files)
+        .filter((entry) => !entry.dir && entry.name.startsWith('rrweb/'))
+        .map(async (entry) => JSON.parse(await entry.async('string')) as unknown[]),
+    )
+  ).flat();
+  expect(exportedRrweb).toContainEqual(
+    expect.objectContaining({
+      type: 3,
+      data: expect.objectContaining({
+        source: 5,
+        text: sentinels.password,
+      }),
+    }),
+  );
   for (const sentinel of Object.values(sentinels)) {
-    expect(exportedText, `exported ZIP leaked ${sentinel}`).not.toContain(sentinel);
+    expect(exportedText, `exported ZIP omitted ${sentinel}`).toContain(sentinel);
   }
+  expect(exportedText).toContain('"captureMode": "full-fidelity"');
+  expect(exportedText).toContain('"redactionCount": 0');
+  expect(exportedText).not.toContain('<redacted>');
 });
 
 test('immediate stop flushes input and a new same-page session records before discard', async ({

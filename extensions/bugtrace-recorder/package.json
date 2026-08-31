@@ -1,8 +1,14 @@
 {
   "name": "@juner/bugtrace-recorder",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Privacy-conscious browser reproduction recorder for humans and agents.",
+  "license": "MIT",
+  "description": "Local full-fidelity browser reproduction recorder for humans and agents.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JUNERDD/chrome-extension.git",
+    "directory": "extensions/bugtrace-recorder"
+  },
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -16,8 +22,11 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@fontsource-variable/jetbrains-mono": "5.3.0",
-    "@fontsource-variable/manrope": "5.3.0",
+    "@heroui/react": "3.2.4",
+    "@heroui/styles": "3.2.4",
+    "@react-aria/i18n": "3.13.1",
+    "@react-aria/ssr": "3.10.1",
+    "@react-aria/utils": "3.34.1",
     "@rrweb/record": "2.1.1",
     "@rrweb/replay": "2.1.1",
     "@rrweb/types": "2.1.1",
@@ -25,12 +34,16 @@
     "idb": "8.0.3",
     "jszip": "3.10.1",
     "react": "19.2.8",
+    "react-aria": "3.51.0",
+    "react-aria-components": "1.20.0",
     "react-dom": "19.2.8",
+    "tailwindcss": "4.3.3",
     "zod": "4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "9.39.2",
     "@playwright/test": "1.62.1",
+    "@tailwindcss/vite": "4.3.3",
     "@types/chrome": "0.2.6",
     "@types/node": "22.20.1",
     "@types/react": "19.2.18",

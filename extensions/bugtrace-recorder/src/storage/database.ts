@@ -121,9 +121,11 @@ export async function listAssets(sessionId: string): Promise<StoredAsset[]> {
 
 export async function deleteSession(sessionId: string): Promise<void> {
   const database = await getDatabase();
+  const [eventKeys, assetKeys] = await Promise.all([
+    database.getAllKeysFromIndex('events', 'by-session', sessionId),
+    database.getAllKeysFromIndex('assets', 'by-session', sessionId),
+  ]);
   const transaction = database.transaction(['sessions', 'events', 'assets'], 'readwrite');
-  const eventKeys = await transaction.objectStore('events').index('by-session').getAllKeys(sessionId);
-  const assetKeys = await transaction.objectStore('assets').index('by-session').getAllKeys(sessionId);
   await Promise.all([
     transaction.objectStore('sessions').delete(sessionId),
     ...eventKeys.map((key) => transaction.objectStore('events').delete(key)),

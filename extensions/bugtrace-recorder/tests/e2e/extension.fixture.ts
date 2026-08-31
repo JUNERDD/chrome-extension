@@ -12,13 +12,17 @@ interface ExtensionFixtures {
 
 export const extensionPath = path.resolve(process.cwd(), '.output/chrome-mv3');
 
-export async function launchExtensionContext(profileDirectory: string): Promise<BrowserContext> {
+export async function launchExtensionContext(
+  profileDirectory: string,
+  loadedExtensionPath = extensionPath,
+): Promise<BrowserContext> {
   return chromium.launchPersistentContext(profileDirectory, {
     channel: 'chromium',
     headless: process.env.PW_HEADED !== '1',
+    locale: 'en-US',
     args: [
-      `--disable-extensions-except=${extensionPath}`,
-      `--load-extension=${extensionPath}`,
+      `--disable-extensions-except=${loadedExtensionPath}`,
+      `--load-extension=${loadedExtensionPath}`,
     ],
   });
 }
@@ -51,9 +55,10 @@ export const test = base.extend<ExtensionFixtures>({
     await run(extensionId);
   },
 
-  controlPage: async ({ extensionContext, extensionId }, run) => {
+  controlPage: async ({ extensionContext, extensionId, extensionWorker }, run) => {
+    await setLanguagePreference(extensionWorker, 'en');
     const page = await extensionContext.newPage();
-    await page.goto(`chrome-extension://${extensionId}/popup.html`);
+    await page.goto(`chrome-extension://${extensionId}/sidepanel.html`);
     await run(page);
   },
 });
@@ -62,16 +67,28 @@ export { expect } from '@playwright/test';
 
 export type RecorderCommand = 'record' | 'pause' | 'resume' | 'stop' | 'discard' | 'screenshot';
 
-interface RuntimeState {
+export interface RuntimeWarning {
+  code: 'runtime_interrupted' | 'capture_gaps' | 'long_recording';
+  count?: number;
+  thresholdMs?: number;
+}
+
+export interface RuntimeState {
   status: 'idle' | 'recording' | 'paused' | 'finalizing' | 'completed' | 'interrupted';
   sessionId: string | null;
+  activeDurationMs: number;
+  scopedTabCount: number;
   eventCount: number;
   gapCount: number;
+  warnings: RuntimeWarning[];
+  /** Compatibility field exposed by stale extension builds. */
+  warning?: string | null;
 }
 
 interface RuntimeResponse {
   ok: boolean;
   error?: string;
+  errorCode?: string;
   state?: RuntimeState;
 }
 
@@ -87,10 +104,46 @@ export async function readState(page: Page): Promise<RuntimeResponse> {
   });
 }
 
+/**
+ * Activates a real Chromium tab through the extension API. `Page.bringToFront()` only changes
+ * Playwright's target focus and does not reliably exercise `chrome.tabs.onActivated`.
+ */
+export async function activateBrowserTab(controlPage: Page, targetPage: Page): Promise<number> {
+  const targetUrl = targetPage.url();
+  return controlPage.evaluate(async (url) => {
+    const tabs = await chrome.tabs.query({});
+    const target = tabs.find((tab) => tab.url === url || tab.pendingUrl === url);
+    if (target?.id === undefined) {
+      throw new Error(`Unable to resolve a Chromium tab for ${url}`);
+    }
+    await chrome.tabs.update(target.id, { active: true });
+    return target.id;
+  }, targetUrl);
+}
+
 export interface StoredEvidence {
   sessions: unknown[];
-  events: Array<{ sessionId?: string; kind?: string; data?: unknown }>;
-  assets: Array<{ metadata?: unknown; byteLength: number }>;
+  events: Array<{
+    id?: string;
+    sessionId?: string;
+    seq?: number;
+    kind?: string;
+    tabId?: string | null;
+    frameId?: string | null;
+    data?: unknown;
+  }>;
+  assets: Array<{ metadata?: unknown; mimeType: string | undefined; byteLength: number }>;
+}
+
+export type LanguagePreference = 'system' | 'en' | 'zh-CN';
+
+export async function setLanguagePreference(
+  worker: Worker,
+  preference: LanguagePreference,
+): Promise<void> {
+  await worker.evaluate(async (nextPreference) => {
+    await chrome.storage.local.set({ 'bugtrace.language-preference': nextPreference });
+  }, preference);
 }
 
 export async function readStoredEvidence(worker: Worker): Promise<StoredEvidence> {
@@ -111,14 +164,23 @@ export async function readStoredEvidence(worker: Worker): Promise<StoredEvidence
     try {
       const [sessions, events, rawAssets] = await Promise.all([
         readStore<unknown>('sessions'),
-        readStore<{ sessionId?: string; kind?: string; data?: unknown }>('events'),
-        readStore<{ metadata?: unknown; bytes?: ArrayBuffer }>('assets'),
+        readStore<{
+          id?: string;
+          sessionId?: string;
+          seq?: number;
+          kind?: string;
+          tabId?: string | null;
+          frameId?: string | null;
+          data?: unknown;
+        }>('events'),
+        readStore<{ metadata?: unknown; mimeType?: string; bytes?: ArrayBuffer }>('assets'),
       ]);
       return {
         sessions,
         events,
         assets: rawAssets.map((asset) => ({
           metadata: asset.metadata,
+          mimeType: asset.mimeType,
           byteLength: asset.bytes?.byteLength ?? 0,
         })),
       };

@@ -26,7 +26,7 @@
   ],
   "properties": {
     "format": { "const": "bugtrace" },
-    "formatVersion": { "const": "1.0.0" },
+    "formatVersion": { "const": "1.1.0" },
     "generator": { "$ref": "#/$defs/generator" },
     "session": { "$ref": "#/$defs/session" },
     "environment": { "$ref": "#/$defs/environment" },
@@ -55,6 +55,7 @@
       "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$"
     },
     "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "positiveInteger": { "type": "integer", "minimum": 1 },
     "nonNegativeNumber": { "type": "number", "minimum": 0 },
     "safePath": {
       "type": "string",
@@ -63,10 +64,20 @@
       "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]+$"
     },
     "missingStatus": {
-      "enum": ["redacted", "omitted", "unsupported", "truncated", "error"]
+      "enum": ["unavailable", "redacted", "omitted", "unsupported", "truncated", "error"]
     },
     "evidenceStatus": {
-      "enum": ["present", "redacted", "omitted", "unsupported", "truncated", "error"]
+      "enum": ["present", "unavailable", "redacted", "omitted", "unsupported", "truncated", "error"]
+    },
+    "jsonValue": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "boolean" },
+        { "type": "number" },
+        { "type": "string" },
+        { "type": "array", "items": { "$ref": "#/$defs/jsonValue" } },
+        { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } }
+      ]
     },
     "missingEvidence": {
       "type": "object",
@@ -172,6 +183,7 @@
       "additionalProperties": false,
       "required": [
         "localOnly",
+        "captureMode",
         "inputValues",
         "urlQueryValues",
         "requestBodies",
@@ -184,12 +196,13 @@
       ],
       "properties": {
         "localOnly": { "const": true },
-        "inputValues": { "const": "redacted" },
-        "urlQueryValues": { "const": "redacted" },
-        "requestBodies": { "const": "omitted" },
-        "responseBodies": { "const": "omitted" },
-        "cookies": { "const": "omitted" },
-        "sensitiveHeaders": { "const": "omitted" },
+        "captureMode": { "enum": ["full-fidelity", "privacy-filtered"] },
+        "inputValues": { "enum": ["captured", "redacted"] },
+        "urlQueryValues": { "enum": ["captured", "redacted"] },
+        "requestBodies": { "enum": ["captured", "unavailable", "omitted"] },
+        "responseBodies": { "enum": ["captured", "unavailable", "omitted"] },
+        "cookies": { "enum": ["captured", "unavailable", "omitted"] },
+        "sensitiveHeaders": { "enum": ["captured", "unavailable", "omitted"] },
         "redactionCount": { "$ref": "#/$defs/nonNegativeInteger" },
         "redactionCountSemantics": { "const": "minimum_observed" },
         "warnings": {
@@ -197,7 +210,25 @@
           "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
           "maxItems": 100
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "captureMode": { "const": "full-fidelity" } },
+            "required": ["captureMode"]
+          },
+          "then": {
+            "properties": {
+              "inputValues": { "const": "captured" },
+              "urlQueryValues": { "const": "captured" },
+              "requestBodies": { "enum": ["captured", "unavailable"] },
+              "responseBodies": { "enum": ["captured", "unavailable"] },
+              "cookies": { "enum": ["captured", "unavailable"] },
+              "sensitiveHeaders": { "enum": ["captured", "unavailable"] }
+            }
+          }
+        }
+      ]
     },
     "coverageArea": {
       "type": "object",
@@ -290,6 +321,16 @@
         "lengthBucket": { "enum": ["empty", "1-4", "5-8", "9-16", "17+"] }
       }
     },
+    "capturedInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "inputType", "value"],
+      "properties": {
+        "status": { "const": "captured" },
+        "inputType": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "value": { "$ref": "#/$defs/jsonValue" }
+      }
+    },
     "scrollPosition": {
       "type": "object",
       "additionalProperties": false,
@@ -305,7 +346,10 @@
       "required": ["mimeType"],
       "properties": {
         "mimeType": { "type": "string", "minLength": 1, "maxLength": 200 },
-        "size": { "$ref": "#/$defs/nonNegativeInteger" }
+        "size": { "$ref": "#/$defs/nonNegativeInteger" },
+        "name": { "type": "string", "maxLength": 4096 },
+        "lastModified": { "$ref": "#/$defs/nonNegativeInteger" },
+        "relativePath": { "type": "string", "maxLength": 4096 }
       }
     },
     "step": {
@@ -314,7 +358,11 @@
       "required": ["id", "seq", "offsetMs", "tabId", "action"],
       "properties": {
         "id": { "$ref": "#/$defs/logicalId" },
-        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "seq": {
+          "$ref": "#/$defs/positiveInteger",
+          "description": "Global session ordering key shared by semantic, navigation, console, network, error, screenshot, and capture-gap records."
+        },
+        "sourceSeq": { "$ref": "#/$defs/nonNegativeInteger" },
         "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
         "tabId": { "$ref": "#/$defs/logicalId" },
         "frameId": { "$ref": "#/$defs/logicalId" },
@@ -329,7 +377,12 @@
           ]
         },
         "observation": { "$ref": "#/$defs/observationOrMissing" },
-        "input": { "$ref": "#/$defs/redactedInput" },
+        "input": {
+          "oneOf": [
+            { "$ref": "#/$defs/capturedInput" },
+            { "$ref": "#/$defs/redactedInput" }
+          ]
+        },
         "key": { "type": "string", "minLength": 1, "maxLength": 200 },
         "modifiers": {
           "type": "array",
@@ -353,7 +406,8 @@
       "required": ["id", "seq", "offsetMs", "tabId", "kind", "phase", "outcome", "url"],
       "properties": {
         "id": { "$ref": "#/$defs/logicalId" },
-        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "seq": { "$ref": "#/$defs/positiveInteger" },
+        "sourceSeq": { "$ref": "#/$defs/nonNegativeInteger" },
         "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
         "tabId": { "$ref": "#/$defs/logicalId" },
         "frameId": { "$ref": "#/$defs/logicalId" },
@@ -372,7 +426,8 @@
       "required": ["id", "seq", "offsetMs", "tabId", "level", "message", "repeatCount"],
       "properties": {
         "id": { "$ref": "#/$defs/logicalId" },
-        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "seq": { "$ref": "#/$defs/positiveInteger" },
+        "sourceSeq": { "$ref": "#/$defs/nonNegativeInteger" },
         "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
         "tabId": { "$ref": "#/$defs/logicalId" },
         "frameId": { "$ref": "#/$defs/logicalId" },
@@ -393,24 +448,71 @@
         { "$ref": "#/$defs/missingEvidence" }
       ]
     },
+    "capturedValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "value"],
+      "properties": {
+        "status": { "const": "captured" },
+        "value": { "$ref": "#/$defs/jsonValue" },
+        "encoding": { "type": "string", "minLength": 1, "maxLength": 100 }
+      }
+    },
+    "capturedOrMissing": {
+      "oneOf": [
+        { "$ref": "#/$defs/capturedValue" },
+        { "$ref": "#/$defs/missingEvidence" }
+      ]
+    },
+    "networkInitiator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "stepId", "relation", "deltaMs"],
+          "properties": {
+            "status": { "const": "linked" },
+            "stepId": { "$ref": "#/$defs/logicalId" },
+            "relation": { "const": "temporal-predecessor" },
+            "deltaMs": { "$ref": "#/$defs/nonNegativeNumber" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": { "const": "unavailable" },
+            "reason": { "type": "string", "minLength": 1, "maxLength": 1000 }
+          }
+        }
+      ]
+    },
     "networkRecord": {
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "seq", "offsetMs", "tabId", "method", "url", "resourceType", "outcome"],
       "properties": {
         "id": { "$ref": "#/$defs/logicalId" },
-        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "seq": { "$ref": "#/$defs/positiveInteger" },
+        "sourceSeq": { "$ref": "#/$defs/nonNegativeInteger" },
         "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
         "tabId": { "$ref": "#/$defs/logicalId" },
         "method": { "type": "string", "pattern": "^[A-Z]+$", "maxLength": 20 },
         "url": { "type": "string", "minLength": 1, "maxLength": 4096 },
         "resourceType": { "type": "string", "minLength": 1, "maxLength": 100 },
         "outcome": { "enum": ["completed", "failed", "redirected"] },
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "initiator": { "$ref": "#/$defs/networkInitiator" },
         "statusCode": { "type": "integer", "minimum": 100, "maximum": 599 },
         "durationMs": { "$ref": "#/$defs/nonNegativeNumber" },
         "fromCache": { "type": "boolean" },
         "contentType": { "$ref": "#/$defs/stringOrMissing" },
         "encodedSize": { "$ref": "#/$defs/numberOrMissing" },
+        "requestHeaders": { "$ref": "#/$defs/capturedOrMissing" },
+        "responseHeaders": { "$ref": "#/$defs/capturedOrMissing" },
+        "requestBody": { "$ref": "#/$defs/capturedOrMissing" },
+        "responseBody": { "$ref": "#/$defs/capturedOrMissing" },
         "error": { "$ref": "#/$defs/observationOrMissing" }
       }
     },
@@ -420,7 +522,8 @@
       "required": ["id", "seq", "offsetMs", "tabId", "kind", "message"],
       "properties": {
         "id": { "$ref": "#/$defs/logicalId" },
-        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "seq": { "$ref": "#/$defs/positiveInteger" },
+        "sourceSeq": { "$ref": "#/$defs/nonNegativeInteger" },
         "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
         "tabId": { "$ref": "#/$defs/logicalId" },
         "frameId": { "$ref": "#/$defs/logicalId" },
@@ -441,7 +544,8 @@
       "required": ["id", "seq", "offsetMs", "tabId", "trigger", "status", "redactionCount"],
       "properties": {
         "id": { "$ref": "#/$defs/logicalId" },
-        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "seq": { "$ref": "#/$defs/positiveInteger" },
+        "sourceSeq": { "$ref": "#/$defs/nonNegativeInteger" },
         "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
         "tabId": { "$ref": "#/$defs/logicalId" },
         "trigger": { "enum": ["manual", "error", "navigation", "stop"] },
@@ -479,8 +583,10 @@
         "id": { "$ref": "#/$defs/logicalId" },
         "tabId": { "$ref": "#/$defs/logicalId" },
         "frameId": { "$ref": "#/$defs/logicalId" },
-        "startSeq": { "$ref": "#/$defs/nonNegativeInteger" },
-        "endSeq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "startSeq": { "$ref": "#/$defs/positiveInteger" },
+        "endSeq": { "$ref": "#/$defs/positiveInteger" },
+        "sourceStartSeq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "sourceEndSeq": { "$ref": "#/$defs/nonNegativeInteger" },
         "startedAtOffsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
         "endedAtOffsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
         "status": { "$ref": "#/$defs/evidenceStatus" },
@@ -515,9 +621,16 @@
       "required": ["id", "seq", "offsetMs", "source", "status", "reason"],
       "properties": {
         "id": { "$ref": "#/$defs/logicalId" },
-        "seq": { "$ref": "#/$defs/nonNegativeInteger" },
+        "seq": { "$ref": "#/$defs/positiveInteger" },
+        "sourceSeq": { "$ref": "#/$defs/nonNegativeInteger" },
         "offsetMs": { "$ref": "#/$defs/nonNegativeInteger" },
-        "source": { "enum": ["semantic", "rrweb", "console", "network", "screenshot", "navigation", "scope", "lifecycle"] },
+        "source": { "$ref": "#/$defs/captureGapSource" },
+        "affectedSources": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/captureGapSource" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
         "status": { "$ref": "#/$defs/missingStatus" },
         "reason": { "type": "string", "minLength": 1, "maxLength": 1000 },
         "tabId": { "$ref": "#/$defs/logicalId" },
@@ -525,6 +638,9 @@
         "droppedCount": { "$ref": "#/$defs/nonNegativeInteger" },
         "observation": { "$ref": "#/$defs/untrustedObservation" }
       }
+    },
+    "captureGapSource": {
+      "enum": ["semantic", "rrweb", "console", "network", "screenshot", "navigation", "scope", "lifecycle"]
     },
     "attachment": {
       "type": "object",

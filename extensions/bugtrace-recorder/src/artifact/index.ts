@@ -21,4 +21,14 @@ export {
   type SecretFindingKind,
 } from './secrets';
 export { buildBugtraceZip, bugtraceZipBlob, sha256Hex } from './bundle';
+export {
+  BugtraceArtifactConsistencyError,
+  assertArtifactConsistency,
+  purposeForEvidencePath,
+  validateEvidenceResourceClosure,
+  validateTraceSemantics,
+  type ArtifactConsistencyIssue,
+  type EvidenceResourceDescriptor,
+} from './semantic';
+export { BugtraceBundleVerificationError, verifyBugtraceZip } from './verifier';
 export * from './types';

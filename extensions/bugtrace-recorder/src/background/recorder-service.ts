@@ -1,22 +1,27 @@
 import { browser } from 'wxt/browser';
+import type { MessageKey } from '../i18n/catalog';
+import { resolveLocale, translateMessage } from '../i18n/core';
+import { getSystemLanguage, loadLanguagePreference } from '../i18n/runtime';
 import {
+  CAPTURE_PROTOCOL_VERSION,
+  CURRENT_RUNTIME_METADATA,
+  LONG_RECORDING_WARNING_THRESHOLD_MS,
+  isCaptureReadyAck,
   isFlushCaptureAck,
   isStateChangedAck,
   jsonUtf8ByteLength,
   type ClientCaptureEvent,
   type RecorderViewState,
   type RuntimeRequest,
+  type RuntimeErrorCode,
   type RuntimeResponse,
+  type StateChangedAck,
   type TransportDropCounts,
   type TransportDropSource,
 } from '../messaging';
 import {
-  createSessionPseudonymizer,
-  redactSecretsInText,
-  serializeConsoleValue,
-} from '../privacy';
-import {
   addDescendantTab,
+  addTopLevelTab,
   createTabScope,
   createIdleState,
   finalize,
@@ -49,7 +54,7 @@ import {
   saveCurrentSessionState,
   type StoredEvent,
 } from '../storage';
-import { captureRedactedScreenshot } from './screenshot';
+import { captureScreenshot } from './screenshot';
 import type {
   NavigationObservation,
   NetworkObservation,
@@ -60,23 +65,39 @@ import type {
 const ACTIVE_STATUSES = new Set(['recording', 'paused', 'interrupted', 'finalizing']);
 const SESSION_TTL_MS = 24 * 60 * 60 * 1_000;
 const FLUSH_TIMEOUT_MS = 4_000;
+const CAPTURE_READY_TIMEOUT_MS = 1_500;
+const CAPTURE_READY_PROBE_TIMEOUT_MS = 250;
+const CAPTURE_READY_POLL_INTERVAL_MS = 75;
+const TAB_LIFECYCLE_BARRIER_TIMEOUT_MS =
+  CAPTURE_READY_TIMEOUT_MS + FLUSH_TIMEOUT_MS + 500;
 const MAX_SCREENSHOTS = 20;
-const MAX_SCREENSHOT_BYTES = 8_000_000;
+const MAX_SCREENSHOT_BYTES = 128_000_000;
 const MAX_PENDING_REQUESTS = 5_000;
 const MAX_NETWORK_EVENTS = 5_000;
-const MAX_NETWORK_BYTES = 5_000_000;
+const MAX_NETWORK_BYTES = 64_000_000;
 const MAX_CONSOLE_EVENTS = 1_000;
-const MAX_CONSOLE_BYTES = 2_000_000;
-const MAX_RRWEB_BYTES = 8_000_000;
+const MAX_CONSOLE_BYTES = 32_000_000;
+const MAX_RRWEB_BYTES = 256_000_000;
 const MAX_SEMANTIC_EVENTS = 50_000;
-const MAX_SEMANTIC_BYTES = 10_000_000;
+const MAX_SEMANTIC_BYTES = 64_000_000;
+
+const STATUS_LABEL_KEYS = {
+  idle: 'sidepanel.status.idle.label',
+  recording: 'sidepanel.status.recording.label',
+  paused: 'sidepanel.status.paused.label',
+  finalizing: 'sidepanel.status.finalizing.label',
+  completed: 'sidepanel.status.completed.label',
+  interrupted: 'sidepanel.status.interrupted.label',
+} as const satisfies Record<RecorderSessionState['status'], MessageKey>;
 
 interface RequestStart {
   startedAt: number;
   method: string;
   type: string;
-  redactedUrl: string;
+  url: string;
   tabId: number;
+  requestHeaders?: Readonly<Record<string, readonly string[]>>;
+  requestBody?: NetworkObservation['requestBody'];
 }
 
 interface ContentClientIdentity {
@@ -116,7 +137,6 @@ export class RecorderService {
   private nextSeq = 1;
   private initialized: Promise<void> | null = null;
   private commandQueue: Promise<void> = Promise.resolve();
-  private pseudonymize = createRuntimePseudonymizer();
   private readonly requestStarts = new Map<string, RequestStart>();
   private readonly contentClients = new Map<string, ContentClientIdentity>();
   private readonly expectedFlushes = new Map<string, ExpectedFlush>();
@@ -128,10 +148,27 @@ export class RecorderService {
   private evidenceWriteQueue: Promise<void> = Promise.resolve();
   private persistenceQueue: Promise<void> = Promise.resolve();
   private stateDeliveryGapKey: string | null = null;
+  private readonly tabLifecycleOperations = new Map<number, Promise<void>>();
+  private readonly windowFocusOperations = new Set<Promise<void>>();
+  private readonly lifecycleOperationEpochs = new Map<Promise<void>, number>();
+  private readonly lifecycleFailures = new Map<
+    number,
+    { sessionId: string | null; message: string }
+  >();
+  private lifecycleEpoch = 0;
+  private lifecycleFailuresHandledThroughEpoch = 0;
+  private lifecycleCancelledThroughEpoch = 0;
+  private readonly tabAdmissionFailureUrls = new Map<number, string>();
+  private readonly reportedUnsupportedUrls = new Map<number, string>();
 
   ensureInitialized(): Promise<void> {
     this.initialized ??= this.initialize();
     return this.initialized;
+  }
+
+  async refreshActionTitle(): Promise<void> {
+    await this.ensureInitialized();
+    await this.updateBadge();
   }
 
   private async initialize(): Promise<void> {
@@ -218,14 +255,25 @@ export class RecorderService {
       this.state.status === 'idle' || now < this.state.lastTransitionAtMs
         ? this.state.activeDurationMs
         : getActiveDurationMs(this.state, now);
-    const warning =
-      this.state.status === 'interrupted'
-        ? 'Browser restarted. Resume explicitly or stop and export the partial session.'
-        : this.gapCount > 0
-          ? `${this.gapCount} capture gap${this.gapCount === 1 ? '' : 's'} recorded.`
-          : activeDurationMs >= 15 * 60 * 1_000
-            ? 'This recording is over 15 minutes; review capacity and stop when the reproduction is complete.'
-            : null;
+    const warnings: RecorderViewState['warnings'] = [
+      ...(this.state.status === 'interrupted'
+        ? [{ code: 'runtime_interrupted' as const }]
+        : []),
+      ...(this.gapCount > 0
+        ? [{ code: 'capture_gaps' as const, count: this.gapCount }]
+        : []),
+      ...(activeDurationMs >= LONG_RECORDING_WARNING_THRESHOLD_MS
+        ? [{
+            code: 'long_recording' as const,
+            thresholdMs: LONG_RECORDING_WARNING_THRESHOLD_MS,
+          }]
+        : []),
+    ];
+    const warning = this.state.status === 'interrupted'
+      ? 'Browser restarted. Resume explicitly or stop and export the partial session.'
+      : activeDurationMs >= LONG_RECORDING_WARNING_THRESHOLD_MS
+        ? 'This recording is over 15 minutes; review capacity and stop when the reproduction is complete.'
+        : null;
     return {
       status: this.state.status,
       sessionId: this.state.sessionId,
@@ -236,6 +284,7 @@ export class RecorderService {
       scopedTabCount: this.state.scope?.tabs.filter((tab) => tab.closedAtMs === null).length ?? 0,
       eventCount: this.eventCount,
       gapCount: this.gapCount,
+      warnings,
       warning,
     };
   }
@@ -245,17 +294,25 @@ export class RecorderService {
     try {
       switch (request.type) {
         case 'GET_STATE':
-          return { ok: true, state: this.getViewState() };
+          return { ok: true, ...CURRENT_RUNTIME_METADATA, state: this.getViewState() };
         case 'SESSION_COMMAND':
           await this.executeCommand(request.command);
-          return { ok: true, state: this.getViewState() };
+          return { ok: true, ...CURRENT_RUNTIME_METADATA, state: this.getViewState() };
+        case 'DELETE_SESSION':
+          await this.deleteRetainedSession(request.sessionId);
+          return { ok: true, ...CURRENT_RUNTIME_METADATA, state: this.getViewState() };
         case 'HELLO': {
           this.rememberContentClient(sender, request.clientId, request.documentId);
           const captureEnabled =
             sender.tabId !== null &&
             isOpenTabInScope(this.state.scope, sender.tabId) &&
             ACTIVE_STATUSES.has(this.state.status);
-          return { ok: true, state: this.getViewState(), captureEnabled };
+          return {
+            ok: true,
+            ...CURRENT_RUNTIME_METADATA,
+            state: this.getViewState(),
+            captureEnabled,
+          };
         }
         case 'CAPTURE_BATCH': {
           const accepted = await this.acceptCaptureBatch(
@@ -264,16 +321,18 @@ export class RecorderService {
             request.events,
             sender,
           );
-          return { ok: true, accepted, state: this.getViewState() };
+          return { ok: true, ...CURRENT_RUNTIME_METADATA, accepted, state: this.getViewState() };
         }
         case 'FLUSH_COMPLETE':
           await this.handleFlushComplete(request, sender);
-          return { ok: true, state: this.getViewState() };
+          return { ok: true, ...CURRENT_RUNTIME_METADATA, state: this.getViewState() };
       }
     } catch (error) {
       return {
         ok: false,
+        ...CURRENT_RUNTIME_METADATA,
         error: error instanceof Error ? error.message : String(error),
+        errorCode: classifyRuntimeError(error, request),
         state: this.getViewState(),
       };
     }
@@ -285,21 +344,77 @@ export class RecorderService {
     return operation;
   }
 
+  deleteRetainedSession(sessionId: string): Promise<void> {
+    const operation = this.commandQueue.then(() => this.deleteRetainedSessionNow(sessionId));
+    this.commandQueue = operation.catch(() => undefined);
+    return operation;
+  }
+
+  private async deleteRetainedSessionNow(sessionId: string): Promise<void> {
+    await this.ensureInitialized();
+    if (this.state.sessionId !== sessionId) {
+      await deleteSession(sessionId);
+      return;
+    }
+    if (this.state.status !== 'completed') {
+      throw new Error(`Cannot delete the current session while recorder is ${this.state.status}.`);
+    }
+
+    const previousState = this.state;
+    this.screenshotEpoch += 1;
+    this.state = createIdleState(Date.now());
+    await Promise.all([this.screenshotQueue, this.evidenceWriteQueue, this.persistenceQueue]);
+    await deleteSession(sessionId);
+    this.eventCount = 0;
+    this.gapCount = 0;
+    this.screenshotCount = 0;
+    this.screenshotBytes = 0;
+    this.networkCount = 0;
+    this.networkBytes = 0;
+    this.consoleCount = 0;
+    this.consoleBytes = 0;
+    this.rrwebBytes = 0;
+    this.semanticCount = 0;
+    this.semanticBytes = 0;
+    this.nextSeq = 1;
+    this.lastScreenshotAt = 0;
+    this.screenshotLimitReported = false;
+    this.requestStarts.clear();
+    this.contentClients.clear();
+    this.expectedFlushes.clear();
+    this.replacedTabIds.clear();
+    this.stateDeliveryGapKey = null;
+    this.tabAdmissionFailureUrls.clear();
+    this.reportedUnsupportedUrls.clear();
+    await this.persist();
+    const view = this.getViewState();
+    await Promise.all([
+      this.broadcastToScope(previousState, view),
+      this.broadcastExtensionState(view),
+      this.updateBadge(),
+    ]);
+    this.contentClients.clear();
+  }
+
   private async executeCommandNow(
     command: 'record' | 'pause' | 'resume' | 'stop' | 'discard' | 'screenshot',
   ): Promise<void> {
     await this.ensureInitialized();
+    if (command === 'pause' || command === 'stop') {
+      await this.waitForPendingTabLifecycleOperations(command);
+    }
     const now = Date.now();
     if (command === 'record') {
       if (!['idle', 'completed'].includes(this.state.status)) {
         throw new Error(`Cannot record while recorder is ${this.state.status}.`);
       }
-      this.screenshotEpoch += 1;
-      await this.screenshotQueue;
       const [tab] = await browser.tabs.query({ active: true, lastFocusedWindow: true });
       if (tab?.id === undefined || tab.windowId === undefined || !isSupportedCaptureUrl(tab.url ?? '')) {
         throw new Error('Start recording from a normal HTTP(S) tab. This page cannot be captured.');
       }
+      await this.requireCaptureClientReady(tab.id);
+      this.screenshotEpoch += 1;
+      await this.screenshotQueue;
       if (this.state.status === 'completed') {
         this.state = createIdleState(now);
         await this.persist();
@@ -328,7 +443,8 @@ export class RecorderService {
       this.expectedFlushes.clear();
       this.replacedTabIds.clear();
       this.stateDeliveryGapKey = null;
-      this.pseudonymize = createRuntimePseudonymizer();
+      this.tabAdmissionFailureUrls.clear();
+      this.reportedUnsupportedUrls.clear();
       await this.appendSystemEvent('session', { action: 'record', rootTabId: 'tab-1' });
       await this.appendChromeEvent('navigation', tab.id, {
         action: 'record_start',
@@ -358,7 +474,6 @@ export class RecorderService {
       return;
     }
     if (command === 'resume') {
-      this.screenshotEpoch += 1;
       let interruptedState: RecorderSessionState | null = null;
       let reboundTab: { id: number; windowId: number; url: string } | null = null;
       if (this.state.status === 'interrupted') {
@@ -368,12 +483,14 @@ export class RecorderService {
             'Resume after a browser restart requires an active HTTP(S) tab, or stop to export the partial session.',
           );
         }
+        await this.requireCaptureClientReady(tab.id);
         if (this.state.status !== 'interrupted') {
           throw new Error('Recorder state changed while the interrupted session was being rebound.');
         }
         interruptedState = this.state;
         reboundTab = { id: tab.id, windowId: tab.windowId, url: tab.url ?? '' };
       }
+      this.screenshotEpoch += 1;
       this.state = resume(this.state, now);
       if (interruptedState && reboundTab) {
         this.state = {
@@ -467,6 +584,8 @@ export class RecorderService {
       this.expectedFlushes.clear();
       this.replacedTabIds.clear();
       this.stateDeliveryGapKey = null;
+      this.tabAdmissionFailureUrls.clear();
+      this.reportedUnsupportedUrls.clear();
       this.requestStarts.clear();
       await this.persist();
       await this.broadcastToScope(previousState, this.getViewState());
@@ -506,12 +625,23 @@ export class RecorderService {
     await this.openResults();
   }
 
-  async handleTabCreated(tab: {
+  handleTabCreated(tab: {
     id?: number | undefined;
     openerTabId?: number | undefined;
     windowId?: number | undefined;
   }): Promise<void> {
+    if (tab.id === undefined) return Promise.resolve();
+    return this.queueTabLifecycleOperation(tab.id, (isCancelled) =>
+      this.handleTabCreatedNow(tab, isCancelled));
+  }
+
+  private async handleTabCreatedNow(tab: {
+    id?: number | undefined;
+    openerTabId?: number | undefined;
+    windowId?: number | undefined;
+  }, isCancelled: () => boolean): Promise<void> {
     await this.ensureInitialized();
+    if (isCancelled()) return;
     if (
       !['recording', 'paused', 'interrupted'].includes(this.state.status) ||
       !this.state.scope ||
@@ -553,7 +683,10 @@ export class RecorderService {
     if (this.state.status === 'recording' && !alreadyScoped) {
       await this.appendChromeEvent('tab', tab.id, { action: 'created', openerTabId: tab.openerTabId });
     }
-    await this.persistAndBroadcast();
+    if (isCancelled()) return;
+    // Scope and HELLO can arrive in either order. Notify any client already known for this tab;
+    // clients injected later receive the same state in their HELLO response.
+    await this.persistScopeAdmission(tab.id);
   }
 
   async handleTabRemoved(tabId: number): Promise<void> {
@@ -678,25 +811,142 @@ export class RecorderService {
     }
   }
 
-  async handleTabActivated(tabId: number): Promise<void> {
-    await this.ensureInitialized();
-    if (this.state.status !== 'recording') return;
-    if (!isOpenTabInScope(this.state.scope, tabId)) {
-      await this.appendGap('User activated a tab outside the recording lineage.', ['semantic', 'rrweb']);
-      await this.persistAndBroadcast();
-      return;
-    }
-    await this.appendChromeEvent('tab', tabId, { action: 'activated' });
+  handleTabActivated(tabId: number): Promise<void> {
+    return this.queueTabLifecycleOperation(tabId, (isCancelled) =>
+      this.handleTabActivatedNow(tabId, isCancelled));
   }
 
-  async handleWindowFocused(windowId: number): Promise<void> {
+  private async handleTabActivatedNow(
+    tabId: number,
+    isCancelled: () => boolean,
+  ): Promise<void> {
     await this.ensureInitialized();
-    if (this.state.status !== 'recording' || windowId === browser.windows.WINDOW_ID_NONE) return;
-    const scopedTab = this.state.scope?.tabs.find(
-      (tab) => tab.windowId === windowId && tab.closedAtMs === null,
+    if (isCancelled()) return;
+    if (!['recording', 'paused'].includes(this.state.status)) return;
+    const wasInScope = isOpenTabInScope(this.state.scope, tabId);
+    const currentTab = await browser.tabs.get(tabId).catch(() => null);
+    if (isCancelled()) return;
+    if (wasInScope) {
+      if (this.state.status === 'recording') {
+        await this.appendChromeEvent('tab', tabId, { action: 'activated' });
+      }
+      return;
+    }
+
+    if (!await this.isUserVisibleTab(tabId)) {
+      return;
+    }
+    if (isCancelled()) return;
+
+    const url = currentTab?.url ?? '';
+    if (!currentTab || currentTab.windowId === undefined || !isSupportedCaptureUrl(url)) {
+      if (isDeferredOrInternalUrl(url)) {
+        return;
+      }
+      await this.reportUnsupportedVisibleTab(tabId, url);
+      return;
+    }
+
+    await this.admitSupportedTopLevelTab(
+      tabId,
+      currentTab,
+      'activation',
+      isCancelled,
     );
-    if (!scopedTab) return;
-    await this.appendChromeEvent('window', scopedTab.tabId, { action: 'focused' });
+  }
+
+  handleTabUpdated(
+    tabId: number,
+    tab: {
+      active?: boolean | undefined;
+      id?: number | undefined;
+      url?: string | undefined;
+      windowId?: number | undefined;
+    },
+    status?: 'unloaded' | 'loading' | 'complete',
+  ): Promise<void> {
+    return this.queueTabLifecycleOperation(tabId, (isCancelled) =>
+      this.handleTabUpdatedNow(tabId, tab, status, isCancelled));
+  }
+
+  private async handleTabUpdatedNow(
+    tabId: number,
+    tab: {
+      active?: boolean | undefined;
+      id?: number | undefined;
+      url?: string | undefined;
+      windowId?: number | undefined;
+    },
+    status: 'unloaded' | 'loading' | 'complete' | undefined,
+    isCancelled: () => boolean,
+  ): Promise<void> {
+    await this.ensureInitialized();
+    if (isCancelled()) return;
+    if (
+      !['recording', 'paused'].includes(this.state.status) ||
+      !tab.active ||
+      isOpenTabInScope(this.state.scope, tabId) ||
+      tab.windowId === undefined
+    ) return;
+    if (!await this.isUserVisibleTab(tabId) || isCancelled()) return;
+    const url = tab.url ?? '';
+    if (!isSupportedCaptureUrl(url)) {
+      if (!isDeferredOrInternalUrl(url, status)) {
+        await this.reportUnsupportedVisibleTab(tabId, url);
+      }
+      return;
+    }
+    await this.admitSupportedTopLevelTab(tabId, tab, 'navigation', isCancelled);
+  }
+
+  handleWindowFocused(windowId: number): Promise<void> {
+    const epoch = ++this.lifecycleEpoch;
+    const run = this.handleWindowFocusedNow(
+      windowId,
+      () => epoch <= this.lifecycleCancelledThroughEpoch,
+      epoch,
+    );
+    const tracked = run
+      .catch((error: unknown) => {
+        this.rememberLifecycleFailure(epoch, error);
+      })
+      .finally(() => {
+        this.windowFocusOperations.delete(tracked);
+        this.lifecycleOperationEpochs.delete(tracked);
+      });
+    this.windowFocusOperations.add(tracked);
+    this.lifecycleOperationEpochs.set(tracked, epoch);
+    return tracked;
+  }
+
+  private async handleWindowFocusedNow(
+    windowId: number,
+    isCancelled: () => boolean,
+    epoch: number,
+  ): Promise<void> {
+    await this.ensureInitialized();
+    if (isCancelled()) return;
+    if (
+      !['recording', 'paused'].includes(this.state.status) ||
+      windowId === browser.windows.WINDOW_ID_NONE
+    ) return;
+    const [activeTab] = await browser.tabs.query({ active: true, windowId });
+    if (isCancelled()) return;
+    if (activeTab?.id === undefined) return;
+    if (!isOpenTabInScope(this.state.scope, activeTab.id)) {
+      await this.queueTabLifecycleOperation(
+        activeTab.id,
+        (tabCancelled) => this.handleTabActivatedNow(
+          activeTab.id!,
+          () => isCancelled() || tabCancelled(),
+        ),
+        epoch,
+      );
+    }
+    if (isCancelled()) return;
+    if (this.state.status === 'recording' && isOpenTabInScope(this.state.scope, activeTab.id)) {
+      await this.appendChromeEvent('window', activeTab.id, { action: 'focused' });
+    }
   }
 
   async handleWindowRemoved(windowId: number): Promise<void> {
@@ -730,11 +980,13 @@ export class RecorderService {
       transitionType: observation.transitionType ?? null,
       transitionQualifiers: observation.transitionQualifiers ?? [],
       error: observation.error ?? null,
-    }, observation.timeStamp, false, {
+    }, observation.timeStamp, {
       frameId: observation.frameId,
       documentId: observation.documentId ?? null,
     });
     if (kind === 'completed' && observation.frameId === 0) {
+      const tab = await browser.tabs.get(observation.tabId).catch(() => null);
+      if (!tab?.active) return;
       void this.captureScreenshot('navigation', observation.tabId)
         .then(() => this.persistAndBroadcast())
         .catch(async (error) => {
@@ -766,9 +1018,18 @@ export class RecorderService {
       startedAt: observation.timeStamp,
       method: observation.method,
       type: observation.type,
-      redactedUrl: observation.url,
+      url: observation.url,
       tabId: observation.tabId,
+      ...(observation.requestHeaders ? { requestHeaders: observation.requestHeaders } : {}),
+      ...(observation.requestBody ? { requestBody: observation.requestBody } : {}),
     });
+  }
+
+  async handleNetworkHeaders(observation: NetworkObservation): Promise<void> {
+    await this.ensureInitialized();
+    const start = this.requestStarts.get(observation.requestId);
+    if (!start || this.state.status !== 'recording') return;
+    if (observation.requestHeaders) start.requestHeaders = observation.requestHeaders;
   }
 
   async handleNetworkEnd(observation: NetworkObservation): Promise<void> {
@@ -776,20 +1037,26 @@ export class RecorderService {
     const start = this.requestStarts.get(observation.requestId);
     this.requestStarts.delete(observation.requestId);
     if (this.state.status !== 'recording' || !isOpenTabInScope(this.state.scope, observation.tabId)) return;
-    const headers = observation.responseHeaders ?? {};
+    const responseHeaders = observation.responseHeaders ?? {};
     const data: Record<string, unknown> = {
+      requestId: observation.requestId,
       method: start?.method ?? observation.method,
-      url: start?.redactedUrl ?? observation.url,
+      url: start?.url ?? observation.url,
       resourceType: start?.type ?? observation.type,
       status: observation.statusCode ?? null,
       durationMs: start ? Math.max(0, observation.timeStamp - start.startedAt) : null,
       fromCache: observation.fromCache ?? false,
-      error: observation.error
-        ? redactSecretsInText(observation.error, this.pseudonymize)
-        : null,
-      headers,
-      requestBody: { state: 'omitted' },
-      responseBody: { state: 'omitted' },
+      error: observation.error ?? null,
+      requestHeaders: start?.requestHeaders ?? {},
+      responseHeaders,
+      requestBody: start?.requestBody ?? observation.requestBody ?? {
+        status: 'unavailable',
+        reason: 'Chrome did not expose a request body for this request.',
+      },
+      responseBody: {
+        status: 'unavailable',
+        reason: 'Chrome webRequest does not expose arbitrary response bodies.',
+      },
     };
     const bytes = jsonSize(data);
     if (this.networkCount >= MAX_NETWORK_EVENTS || this.networkBytes + bytes > MAX_NETWORK_BYTES) {
@@ -808,8 +1075,7 @@ export class RecorderService {
         'network',
         observation.tabId,
         data,
-        observation.timeStamp,
-        true,
+        start?.startedAt ?? observation.timeStamp,
       );
       if (!eventId) throw new Error('Network evidence admission expired before persistence.');
     } catch (error) {
@@ -825,12 +1091,10 @@ export class RecorderService {
     events: ClientCaptureEvent[],
     sender: SenderContext,
   ): Promise<number> {
-    if (
-      this.state.sessionId !== sessionId ||
-      sender.tabId === null ||
-      !isOpenTabInScope(this.state.scope, sender.tabId) ||
-      !['recording', 'paused', 'finalizing'].includes(this.state.status)
-    ) {
+    const sessionMatches = this.state.sessionId === sessionId;
+    const inScope = sender.tabId !== null && isOpenTabInScope(this.state.scope, sender.tabId);
+    const statusAcceptsBatch = ['recording', 'paused', 'finalizing'].includes(this.state.status);
+    if (!sessionMatches || sender.tabId === null || !inScope || !statusAcceptsBatch) {
       throw new Error('Capture batch does not belong to the active recording scope.');
     }
     const clientIds = new Set(events.map((event) => event.clientId));
@@ -942,6 +1206,359 @@ export class RecorderService {
     expected.droppedBySource = { ...request.droppedBySource };
   }
 
+  private queueTabLifecycleOperation(
+    tabId: number,
+    work: (isCancelled: () => boolean) => Promise<void>,
+    inheritedEpoch?: number,
+  ): Promise<void> {
+    const epoch = inheritedEpoch ?? ++this.lifecycleEpoch;
+    const previous = this.tabLifecycleOperations.get(tabId) ?? Promise.resolve();
+    const run = previous.then(() => work(
+      () => epoch <= this.lifecycleCancelledThroughEpoch,
+    ));
+    const tracked = run
+      .catch((error: unknown) => {
+        this.rememberLifecycleFailure(epoch, error);
+      })
+      .finally(() => {
+        if (this.tabLifecycleOperations.get(tabId) === tracked) {
+          this.tabLifecycleOperations.delete(tabId);
+        }
+        this.lifecycleOperationEpochs.delete(tracked);
+      });
+    this.tabLifecycleOperations.set(tabId, tracked);
+    this.lifecycleOperationEpochs.set(tracked, epoch);
+    return tracked;
+  }
+
+  private rememberLifecycleFailure(epoch: number, error: unknown): void {
+    if (epoch <= this.lifecycleFailuresHandledThroughEpoch) return;
+    this.lifecycleFailures.set(epoch, {
+      sessionId: this.state.sessionId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  private async waitForPendingTabLifecycleOperations(
+    command: 'pause' | 'stop',
+  ): Promise<void> {
+    const cutoffEpoch = this.lifecycleEpoch;
+    const tabSnapshot = [...this.tabLifecycleOperations.entries()].filter(([, operation]) =>
+      (this.lifecycleOperationEpochs.get(operation) ?? Number.POSITIVE_INFINITY) <= cutoffEpoch);
+    const windowSnapshot = [...this.windowFocusOperations].filter((operation) =>
+      (this.lifecycleOperationEpochs.get(operation) ?? Number.POSITIVE_INFINITY) <= cutoffEpoch);
+    const pending = [...new Set([
+      ...tabSnapshot.map(([, operation]) => operation),
+      ...windowSnapshot,
+    ])];
+    let timedOut = false;
+    if (pending.length > 0) {
+      timedOut = !await withTimeout(
+        Promise.all(pending).then(() => true),
+        TAB_LIFECYCLE_BARRIER_TIMEOUT_MS,
+      ).catch(() => false);
+    }
+
+    if (timedOut) {
+      this.lifecycleCancelledThroughEpoch = Math.max(
+        this.lifecycleCancelledThroughEpoch,
+        cutoffEpoch,
+      );
+      for (const [tabId, operation] of this.tabLifecycleOperations) {
+        if (
+          (this.lifecycleOperationEpochs.get(operation) ?? Number.POSITIVE_INFINITY) <= cutoffEpoch &&
+          this.tabLifecycleOperations.get(tabId) === operation
+        ) {
+          this.tabLifecycleOperations.delete(tabId);
+        }
+      }
+      for (const operation of this.windowFocusOperations) {
+        if (
+          (this.lifecycleOperationEpochs.get(operation) ?? Number.POSITIVE_INFINITY) <= cutoffEpoch
+        ) {
+          this.windowFocusOperations.delete(operation);
+        }
+      }
+    }
+
+    const sessionId = this.state.sessionId;
+    const failed = [...this.lifecycleFailures.entries()].filter(
+      ([epoch, failure]) => epoch <= cutoffEpoch && failure.sessionId === sessionId,
+    );
+    for (const epoch of [...this.lifecycleFailures.keys()]) {
+      if (epoch <= cutoffEpoch) this.lifecycleFailures.delete(epoch);
+    }
+    this.lifecycleFailuresHandledThroughEpoch = Math.max(
+      this.lifecycleFailuresHandledThroughEpoch,
+      cutoffEpoch,
+    );
+
+    if (failed.length === 0 && !timedOut) return;
+    const failureDetails = [...new Set(failed.map(([, failure]) => failure.message))]
+      .slice(0, 2)
+      .join('; ')
+      .slice(0, 500);
+    const reasons = [
+      ...(failed.length > 0
+        ? [
+            `${failed.length} queued tab lifecycle operation(s) failed before ${command}: ${failureDetails}`,
+          ]
+        : []),
+      ...(timedOut
+        ? [`The tab lifecycle barrier reached its ${TAB_LIFECYCLE_BARRIER_TIMEOUT_MS} ms deadline before ${command}.`]
+        : []),
+    ];
+    await this.appendGap(reasons.join(' '), [
+      'lifecycle',
+      'scope',
+      'semantic',
+      'rrweb',
+      'console',
+    ]);
+  }
+
+  private async isUserVisibleTab(tabId: number): Promise<boolean> {
+    const [visibleTab] = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+    return visibleTab?.id === tabId;
+  }
+
+  private async reportUnsupportedVisibleTab(tabId: number, url: string): Promise<void> {
+    if (this.reportedUnsupportedUrls.get(tabId) === url) return;
+    this.reportedUnsupportedUrls.set(tabId, url);
+    await this.appendGap(
+      'The active tab uses a restricted or unsupported URL; page-level evidence is unavailable.',
+      ['semantic', 'rrweb', 'console', 'screenshots'],
+    );
+    await this.persistAndBroadcast(false);
+  }
+
+  private async persistScopeAdmission(tabId: number): Promise<void> {
+    await this.persist();
+    const view = this.getViewState();
+    const knownClients = [...this.contentClients.values()].filter(
+      (client) => client.tabId === tabId,
+    );
+    const deliveryResults = await Promise.all(
+      knownClients.map((client) => this.deliverScopeAdmissionState(client, view)),
+    );
+    const deliveryFailures = deliveryResults.filter((delivered) => !delivered).length;
+    if (deliveryFailures > 0) {
+      await this.appendGap(
+        `${deliveryFailures} known content client(s) did not acknowledge scope admission after a bounded retry.`,
+        ['lifecycle', 'semantic', 'rrweb', 'console'],
+        tabId,
+      );
+      await this.persist();
+    }
+    await Promise.all([
+      this.updateBadge(),
+      this.broadcastExtensionState(this.getViewState()),
+    ]);
+  }
+
+  private async deliverScopeAdmissionState(
+    client: ContentClientIdentity,
+    view: RecorderViewState,
+  ): Promise<boolean> {
+    if (
+      await this.tryDeliverScopeAdmissionState(
+        client.tabId,
+        client.frameId,
+        client.chromeDocumentId,
+        view,
+      )
+    ) return true;
+
+    const frames = await withTimeout(
+      browser.webNavigation.getAllFrames({ tabId: client.tabId }),
+      CAPTURE_READY_PROBE_TIMEOUT_MS,
+    ).catch(() => null);
+    const currentFrame = frames?.find((frame) => frame.frameId === client.frameId);
+    if (!currentFrame) return false;
+    return this.tryDeliverScopeAdmissionState(
+      client.tabId,
+      client.frameId,
+      currentFrame.documentId ?? null,
+      view,
+    );
+  }
+
+  private async tryDeliverScopeAdmissionState(
+    tabId: number,
+    frameId: number,
+    chromeDocumentId: string | null,
+    view: RecorderViewState,
+  ): Promise<boolean> {
+    try {
+      const response = await withTimeout(
+        browser.tabs.sendMessage(
+          tabId,
+          { type: 'STATE_CHANGED', state: view, captureEnabled: true },
+          messageTargetOptions(frameId, chromeDocumentId),
+        ),
+        CAPTURE_READY_TIMEOUT_MS,
+      );
+      if (!isStateAckAtLeast(response, view)) return false;
+      this.rememberContentClientForFrame(
+        tabId,
+        frameId,
+        chromeDocumentId,
+        response.clientId,
+        response.documentId,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async admitSupportedTopLevelTab(
+    tabId: number,
+    tab: { url?: string | undefined; windowId?: number | undefined },
+    admission: 'activation' | 'navigation',
+    isCancelled: () => boolean,
+  ): Promise<boolean> {
+    if (isCancelled()) return false;
+    const sessionId = this.state.sessionId;
+    if (
+      !sessionId ||
+      !['recording', 'paused'].includes(this.state.status) ||
+      !this.state.scope ||
+      isOpenTabInScope(this.state.scope, tabId) ||
+      tab.windowId === undefined ||
+      !isSupportedCaptureUrl(tab.url ?? '')
+    ) return isOpenTabInScope(this.state.scope, tabId);
+
+    const ready = await this.waitForCaptureClientReady(tabId);
+    if (isCancelled()) return false;
+    const currentTab = await browser.tabs.get(tabId).catch(() => null);
+    if (isCancelled()) return false;
+    if (
+      !ready ||
+      !currentTab ||
+      currentTab.windowId === undefined ||
+      !isSupportedCaptureUrl(currentTab.url ?? '')
+    ) {
+      if (
+        this.state.sessionId === sessionId &&
+        ['recording', 'paused'].includes(this.state.status) &&
+        this.tabAdmissionFailureUrls.get(tabId) !== (currentTab?.url ?? tab.url ?? '')
+      ) {
+        this.tabAdmissionFailureUrls.set(tabId, currentTab?.url ?? tab.url ?? '');
+        await this.appendGap(
+          'A supported active tab did not expose a compatible capture client before the readiness deadline.',
+          ['semantic', 'rrweb', 'console'],
+        );
+        await this.persistAndBroadcast(false);
+      }
+      return false;
+    }
+    if (
+      this.state.sessionId !== sessionId ||
+      !['recording', 'paused'].includes(this.state.status) ||
+      !this.state.scope
+    ) return false;
+    if (isOpenTabInScope(this.state.scope, tabId)) return true;
+
+    const addedAtMs = Date.now();
+    const openerTabId = currentTab.openerTabId;
+    const hasScopedOpener =
+      openerTabId !== undefined && isOpenTabInScope(this.state.scope, openerTabId);
+    const nextScope = hasScopedOpener
+      ? addDescendantTab(this.state.scope, {
+          tabId,
+          openerTabId,
+          windowId: currentTab.windowId,
+          addedAtMs,
+        })
+      : addTopLevelTab(this.state.scope, {
+          tabId,
+          windowId: currentTab.windowId,
+          addedAtMs,
+        });
+    this.state = {
+      ...this.state,
+      revision: this.state.revision + 1,
+      scope: nextScope,
+    };
+    this.tabAdmissionFailureUrls.delete(tabId);
+    this.reportedUnsupportedUrls.delete(tabId);
+    if (this.state.status === 'recording') {
+      const observedAt = Date.now();
+      await this.appendChromeEvent('tab', tabId, {
+        action: 'admitted',
+        admission,
+        ...(hasScopedOpener ? { openerTabId } : {}),
+      }, observedAt);
+      await this.appendChromeEvent('navigation', tabId, {
+        action: 'scope_adopted',
+        kind: 'document',
+        url: currentTab.url ?? '',
+        transitionType: admission,
+      }, observedAt);
+    }
+
+    const excludedTabIds = new Set(
+      nextScope.tabs
+        .filter((candidate) => candidate.closedAtMs === null && candidate.tabId !== tabId)
+        .map((candidate) => candidate.tabId),
+    );
+    await this.persistAndBroadcast(true, excludedTabIds);
+    return true;
+  }
+
+  private async requireCaptureClientReady(tabId: number): Promise<void> {
+    const unavailable = (): RuntimeCodedError =>
+      new RuntimeCodedError(
+        'The capture client is unavailable or incompatible. Reload the current tab and try again.',
+        'capture_client_unavailable',
+      );
+    if (!await this.probeCaptureClientReady(tabId, CAPTURE_READY_TIMEOUT_MS)) throw unavailable();
+  }
+
+  private async waitForCaptureClientReady(tabId: number): Promise<boolean> {
+    const deadline = Date.now() + CAPTURE_READY_TIMEOUT_MS;
+    do {
+      const remainingMs = Math.max(1, deadline - Date.now());
+      if (
+        await this.probeCaptureClientReady(
+          tabId,
+          Math.min(CAPTURE_READY_PROBE_TIMEOUT_MS, remainingMs),
+        )
+      ) return true;
+      if (Date.now() >= deadline) break;
+      await delay(Math.min(CAPTURE_READY_POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
+    } while (Date.now() < deadline);
+    return false;
+  }
+
+  private async probeCaptureClientReady(tabId: number, timeoutMs: number): Promise<boolean> {
+    const frames = await browser.webNavigation.getAllFrames({ tabId }).catch(() => null);
+    const topFrame = frames?.find((frame) => frame.frameId === 0);
+    if (!topFrame) return false;
+    try {
+      const response = await withTimeout(
+        browser.tabs.sendMessage(
+          tabId,
+          { type: 'CAPTURE_READY', protocolVersion: CAPTURE_PROTOCOL_VERSION },
+          messageTargetOptions(0, topFrame.documentId ?? null),
+        ),
+        timeoutMs,
+      );
+      if (!isCaptureReadyAck(response)) return false;
+      this.rememberContentClientForFrame(
+        tabId,
+        0,
+        topFrame.documentId ?? null,
+        response.clientId,
+        response.documentId,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private rememberContentClient(
     sender: SenderContext,
     clientId: string,
@@ -1013,18 +1630,8 @@ export class RecorderService {
       frameId: sender.frameId === null ? null : `frame-${sender.frameId}`,
       documentId: sender.documentId ?? null,
       trust: 'untrusted_observation',
-      data: this.redactObservation(event.data, event.kind),
+      data: event.data,
     };
-  }
-
-  private redactObservation(data: Record<string, unknown>, kind: string): Record<string, unknown> {
-    if (kind === 'console' || kind === 'error') {
-      const serialized = serializeConsoleValue(data, { pseudonymizer: this.pseudonymize });
-      return typeof serialized === 'object' && serialized !== null && !Array.isArray(serialized)
-        ? { ...serialized }
-        : { value: serialized };
-    }
-    return redactRecursively(data, this.pseudonymize) as Record<string, unknown>;
   }
 
   private writeEvents(events: StoredEvent[]): Promise<void> {
@@ -1069,7 +1676,6 @@ export class RecorderService {
     tabId: number,
     data: Record<string, unknown>,
     observedAt = Date.now(),
-    dataAlreadyRedacted = false,
     context: { frameId?: number; documentId?: string | null } = {},
   ): Promise<string | null> {
     if (
@@ -1096,9 +1702,7 @@ export class RecorderService {
         frameId: context.frameId === undefined ? null : `frame-${context.frameId}`,
         documentId: context.documentId ?? null,
         trust: 'extension',
-        data: dataAlreadyRedacted
-          ? data
-          : (redactRecursively(data, this.pseudonymize) as Record<string, unknown>),
+        data,
       },
     ]);
     this.eventCount += 1;
@@ -1170,9 +1774,9 @@ export class RecorderService {
     if (tabId === undefined || !scoped || scoped.closedAtMs !== null || scoped.windowId === null) {
       throw new Error('Screenshot skipped because no visible scoped tab is available.');
     }
-    let screenshot: Awaited<ReturnType<typeof captureRedactedScreenshot>>;
+    let screenshot: Awaited<ReturnType<typeof captureScreenshot>>;
     try {
-      screenshot = await captureRedactedScreenshot(tabId, scoped.windowId);
+      screenshot = await captureScreenshot(tabId, scoped.windowId);
     } catch (error) {
       if (!this.screenshotAllowed(trigger, sessionId, epoch)) return;
       throw error;
@@ -1199,7 +1803,7 @@ export class RecorderService {
       bytes: screenshot.bytes,
       metadata: {
         assetId,
-        path: `screenshots/${assetId}.webp`,
+        path: `screenshots/${assetId}.png`,
         trigger,
         tabId: `tab-${tabId}`,
         width: screenshot.width,
@@ -1214,7 +1818,7 @@ export class RecorderService {
     }
     const eventId = await this.appendChromeEvent('screenshot', tabId, {
       assetId,
-      path: `screenshots/${assetId}.webp`,
+      path: `screenshots/${assetId}.png`,
       trigger,
       mimeType: screenshot.mimeType,
       width: screenshot.width,
@@ -1338,7 +1942,11 @@ export class RecorderService {
       eventCount,
       gapCount,
       screenshotCount,
-      generator: { name: 'Bugtrace Recorder', version: '0.1.0', formatVersion: '1.0.0' },
+      generator: {
+        name: 'Bugtrace Recorder',
+        version: String(browser.runtime.getManifest().version),
+        formatVersion: '1.1.0',
+      },
     };
     const operation = this.persistenceQueue.then(async () => {
       if (!state.sessionId) {
@@ -1359,12 +1967,17 @@ export class RecorderService {
     await operation;
   }
 
-  private async persistAndBroadcast(includeScopedTabs = true): Promise<void> {
+  private async persistAndBroadcast(
+    includeScopedTabs = true,
+    excludedTabIds: ReadonlySet<number> = new Set(),
+  ): Promise<void> {
     await this.persist();
     const view = this.getViewState();
     const [, deliveryFailures] = await Promise.all([
       this.updateBadge(),
-      includeScopedTabs ? this.broadcastState() : this.broadcastExtensionState(view),
+      includeScopedTabs
+        ? this.broadcastState(excludedTabIds)
+        : this.broadcastExtensionState(view),
     ]);
     const deliveryKey = `${this.state.sessionId ?? 'idle'}:${this.state.revision}:${this.state.status}`;
     if (
@@ -1382,13 +1995,14 @@ export class RecorderService {
     }
   }
 
-  private async broadcastState(): Promise<number> {
+  private async broadcastState(excludedTabIds: ReadonlySet<number> = new Set()): Promise<number> {
     const view = this.getViewState();
     void this.broadcastExtensionState(view);
     return this.broadcastToScope(
       this.state,
       view,
       ACTIVE_STATUSES.has(this.state.status),
+      excludedTabIds,
     );
   }
 
@@ -1434,12 +2048,9 @@ export class RecorderService {
             ),
             FLUSH_TIMEOUT_MS,
           );
-          if (
-            !isStateChangedAck(response) ||
-            response.appliedRevision !== view.revision ||
-            response.sessionId !== view.sessionId ||
-            response.transitionedAtMs !== view.transitionedAtMs
-          ) return false;
+          if (!isStateAckAtLeast(response, view)) {
+            return false;
+          }
           this.rememberContentClientForFrame(
             target.tabId,
             target.frameId,
@@ -1465,10 +2076,16 @@ export class RecorderService {
       completed: { text: 'OK', color: '#34775d' },
       interrupted: { text: '!', color: '#6e7880' },
     }[this.state.status];
+    const preference = await loadLanguagePreference().catch(() => 'system' as const);
+    const locale = resolveLocale(preference, getSystemLanguage());
+    const title = translateMessage(locale, 'toolbar.title', {
+      app: translateMessage(locale, 'common.appName'),
+      status: translateMessage(locale, STATUS_LABEL_KEYS[this.state.status]),
+    });
     await Promise.all([
       browser.action.setBadgeText({ text: badge.text }),
       browser.action.setBadgeBackgroundColor({ color: badge.color }),
-      browser.action.setTitle({ title: `Bugtrace Recorder · ${this.state.status}` }),
+      browser.action.setTitle({ title }),
     ]);
   }
 
@@ -1496,20 +2113,6 @@ export class RecorderService {
   }
 }
 
-function redactRecursively(value: unknown, pseudonymize: (secret: string) => string, depth = 0): unknown {
-  if (depth > 24) return '[truncated]';
-  if (typeof value === 'string') return redactSecretsInText(value, pseudonymize);
-  if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
-  if (Array.isArray(value)) return value.slice(0, 10_000).map((item) => redactRecursively(item, pseudonymize, depth + 1));
-  if (typeof value !== 'object') return String(value);
-  const output: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value).slice(0, 10_000)) {
-    if (/^(?:request|response)?body$/iu.test(key)) output[key] = { state: 'omitted' };
-    else output[key] = redactRecursively(item, pseudonymize, depth + 1);
-  }
-  return output;
-}
-
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -1524,11 +2127,51 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   }
 }
 
-function createRuntimePseudonymizer(): ReturnType<typeof createSessionPseudonymizer> {
-  const seed = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0;
-  // Each worker epoch uses a disjoint high-range namespace. This avoids falsely equating two
-  // different secrets after MV3 rehydration without persisting a reversible raw-value map.
-  return createSessionPseudonymizer(seed * 1_000_000 + 1);
+function delay(durationMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, durationMs));
+}
+
+function isStateAckAtLeast(
+  value: unknown,
+  view: RecorderViewState,
+): value is StateChangedAck {
+  return (
+    isStateChangedAck(value) &&
+    value.sessionId === view.sessionId &&
+    value.appliedRevision >= view.revision &&
+    value.transitionedAtMs >= view.transitionedAtMs
+  );
+}
+
+function protocolOf(url: string | undefined): string {
+  if (!url) return 'unknown';
+  try {
+    return new URL(url).protocol;
+  } catch {
+    return 'invalid';
+  }
+}
+
+function isDeferredOrInternalUrl(
+  url: string,
+  status?: 'unloaded' | 'loading' | 'complete',
+): boolean {
+  const protocol = protocolOf(url);
+  if (protocol === 'chrome-extension:') {
+    try {
+      if (new URL(url).origin === new URL(browser.runtime.getURL('/')).origin) return true;
+    } catch {
+      return false;
+    }
+  }
+  if (status === 'complete') return false;
+  return (
+    !url ||
+    url === 'about:blank' ||
+    url === 'about:newtab' ||
+    url.startsWith('chrome://newtab') ||
+    protocol === 'chrome-search:'
+  );
 }
 
 function jsonSize(value: unknown): number {
@@ -1562,6 +2205,53 @@ function sameTransportDrops(left: TransportDropCounts, right: TransportDropCount
     left.console === right.console &&
     left.lifecycle === right.lifecycle
   );
+}
+
+class RuntimeCodedError extends Error {
+  constructor(
+    message: string,
+    readonly errorCode: RuntimeErrorCode,
+  ) {
+    super(message);
+    this.name = 'RuntimeCodedError';
+  }
+}
+
+function classifyRuntimeError(error: unknown, request: RuntimeRequest): RuntimeErrorCode {
+  if (error instanceof RuntimeCodedError) return error.errorCode;
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  if (
+    message.includes('document changed') ||
+    message.includes('document with id') ||
+    /frame(?: with id)? .* (?:was )?(?:removed|navigated)/u.test(message)
+  ) {
+    return 'screenshot_document_changed';
+  }
+  if (
+    message.includes('activetab') ||
+    message.includes('<all_urls>') ||
+    (message.includes('permission') && message.includes('screenshot'))
+  ) {
+    return 'screenshot_authorization_required';
+  }
+  if (
+    message.includes('no visible scoped tab') ||
+    message.includes('scoped tab is not visible') ||
+    message.includes('active tab changed during capture')
+  ) {
+    return 'screenshot_outside_scope';
+  }
+  if (
+    message.includes('receiving end does not exist') ||
+    message.includes('could not establish connection') ||
+    message.includes('message port closed') ||
+    message.includes('sensitive regions could not be confirmed')
+  ) {
+    return 'capture_client_unavailable';
+  }
+  return request.type === 'SESSION_COMMAND' && request.command === 'screenshot'
+    ? 'screenshot_failed'
+    : 'operation_rejected';
 }
 
 function messageTargetOptions(

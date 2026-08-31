@@ -57,65 +57,7 @@ function truncate(value: string, maxLength = 160): string {
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
 }
 
-function isEditableTextTarget(element: Element): boolean {
-  if (
-    element instanceof HTMLInputElement ||
-    element instanceof HTMLTextAreaElement ||
-    element instanceof HTMLSelectElement
-  ) {
-    return true;
-  }
-  return element.matches(EDITABLE_TEXT_SELECTOR);
-}
-
-function isWithinEditableTextTarget(element: Element): boolean {
-  let current: Element | null = element;
-  while (current) {
-    if (isEditableTextTarget(current)) return true;
-    if (current.parentElement) {
-      current = current.parentElement;
-      continue;
-    }
-    const root = current.getRootNode();
-    current = root instanceof ShadowRoot ? root.host : null;
-  }
-  return false;
-}
-
-function editableValue(element: Element): string | null {
-  let current: Element | null = element;
-  while (current) {
-    if (
-      current instanceof HTMLInputElement ||
-      current instanceof HTMLTextAreaElement ||
-      current instanceof HTMLSelectElement
-    ) {
-      return current.value;
-    }
-    if (
-      (current instanceof HTMLElement && current.isContentEditable) ||
-      ['textbox', 'searchbox', 'combobox'].includes(current.getAttribute('role') ?? '')
-    ) {
-      return current.textContent ?? '';
-    }
-    if (current.parentElement) {
-      current = current.parentElement;
-      continue;
-    }
-    const root = current.getRootNode();
-    current = root instanceof ShadowRoot ? root.host : null;
-  }
-  return null;
-}
-
-function excludesEditableValue(element: Element, candidate: string | null): string | null {
-  if (!candidate) return null;
-  const rawValue = editableValue(element)?.trim();
-  return rawValue && candidate.includes(rawValue) ? null : candidate;
-}
-
 function safeTextContent(element: Element): string | null {
-  if (isWithinEditableTextTarget(element) || element.matches(BLOCKED_TARGET_SELECTOR)) return null;
   const parts: string[] = [];
   const visit = (node: Node): void => {
     if (node instanceof Text) {
@@ -125,9 +67,7 @@ function safeTextContent(element: Element): string | null {
     if (!(node instanceof Element)) return;
     if (
       node !== element &&
-      (isEditableTextTarget(node) ||
-        node.matches(BLOCKED_TARGET_SELECTOR) ||
-        ['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(node.tagName))
+      ['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(node.tagName)
     ) {
       return;
     }
@@ -145,7 +85,7 @@ function cssEscape(value: string): string {
 
 function labelText(element: Element): string | null {
   const ariaLabel = element.getAttribute('aria-label');
-  if (ariaLabel) return excludesEditableValue(element, truncate(ariaLabel));
+  if (ariaLabel) return truncate(ariaLabel);
 
   const labelledBy = element.getAttribute('aria-labelledby');
   if (labelledBy) {
@@ -156,7 +96,7 @@ function labelText(element: Element): string | null {
         return label ? (safeTextContent(label) ?? '') : '';
       })
       .join(' ');
-    if (value.trim()) return excludesEditableValue(element, truncate(value));
+    if (value.trim()) return truncate(value);
   }
 
   if (
@@ -166,14 +106,14 @@ function labelText(element: Element): string | null {
     element.labels?.length
   ) {
     const value = [...element.labels].map((label) => safeTextContent(label) ?? '').join(' ');
-    if (value.trim()) return excludesEditableValue(element, truncate(value));
+    if (value.trim()) return truncate(value);
   }
 
   const fallback =
     element.getAttribute('alt') ??
     element.getAttribute('title') ??
     safeTextContent(element);
-  return fallback?.trim() ? excludesEditableValue(element, truncate(fallback)) : null;
+  return fallback?.trim() ? truncate(fallback) : null;
 }
 
 function stableCssPath(element: Element): string {
@@ -267,10 +207,7 @@ export function elementFromEvent(event: Event): Element | null {
 
 export function describeTarget(element: Element): TargetDescriptor {
   const locators: LocatorCandidate[] = [];
-  const rawEditableValue = editableValue(element)?.trim() ?? '';
-  const addLocator = (candidate: LocatorCandidate): void => {
-    if (!rawEditableValue || !candidate.value.includes(rawEditableValue)) locators.push(candidate);
-  };
+  const addLocator = (candidate: LocatorCandidate): void => void locators.push(candidate);
 
   for (const attribute of TEST_ATTRIBUTES) {
     const value = element.getAttribute(attribute);
@@ -293,7 +230,7 @@ export function describeTarget(element: Element): TargetDescriptor {
     tag: element.tagName.toLowerCase(),
     role,
     accessibleName,
-    text: isWithinEditableTextTarget(element) ? null : labelText(element),
+    text: labelText(element),
     locators: locators.slice(0, 6),
     framePath: contextPaths.framePath,
     shadowPath: contextPaths.shadowPath,

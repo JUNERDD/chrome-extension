@@ -2,7 +2,12 @@
   "name": "chrome-extension-collection",
   "version": "0.0.0",
   "private": true,
-  "description": "A private workspace for focused Chrome extensions.",
+  "license": "MIT",
+  "description": "Open-source workspace for focused Chrome extensions.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JUNERDD/chrome-extension.git"
+  },
   "packageManager": "pnpm@11.22.0",
   "engines": {
     "node": ">=22.13"
@@ -12,6 +17,13 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
-    "test": "pnpm -r test"
+    "test": "pnpm -r test",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "audit:dependencies": "pnpm audit --audit-level high",
+    "package:zip": "pnpm --filter @juner/bugtrace-recorder zip",
+    "verify:zip": "node scripts/verify-chrome-zip.mjs extensions/bugtrace-recorder",
+    "release:bugtrace:major": "pnpm --dir extensions/bugtrace-recorder version major --tag-version-prefix=bugtrace-recorder-v -m \"publish(bugtrace-recorder): release v%s\"",
+    "release:bugtrace:minor": "pnpm --dir extensions/bugtrace-recorder version minor --tag-version-prefix=bugtrace-recorder-v -m \"publish(bugtrace-recorder): release v%s\"",
+    "release:bugtrace:patch": "pnpm --dir extensions/bugtrace-recorder version patch --tag-version-prefix=bugtrace-recorder-v -m \"publish(bugtrace-recorder): release v%s\""
   }
 }

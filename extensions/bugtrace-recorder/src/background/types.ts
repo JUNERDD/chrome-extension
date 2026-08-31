@@ -8,7 +8,7 @@ export interface PersistedRecorderSession {
   generator: {
     name: 'Bugtrace Recorder';
     version: string;
-    formatVersion: '1.0.0';
+    formatVersion: '1.0.0' | '1.1.0';
   };
 }
 
@@ -42,5 +42,18 @@ export interface NetworkObservation {
   statusCode?: number | undefined;
   fromCache?: boolean | undefined;
   error?: string | undefined;
-  responseHeaders?: Readonly<Record<string, string>> | undefined;
+  requestHeaders?: Readonly<Record<string, readonly string[]>> | undefined;
+  responseHeaders?: Readonly<Record<string, readonly string[]>> | undefined;
+  requestBody?: NetworkBodyObservation | undefined;
 }
+
+export type NetworkBodyObservation =
+  | {
+      status: 'captured';
+      value: unknown;
+      encoding?: 'form-data' | 'base64';
+    }
+  | {
+      status: 'unavailable';
+      reason: string;
+    };

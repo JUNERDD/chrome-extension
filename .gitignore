@@ -1,25 +1,63 @@
 # Dependencies and package manager state
 node_modules/
 .pnpm-store/
+.pnp
+.pnp.js
 
 # WXT and build output
 .wxt/
 .output/
 dist/
+out/
+build/
 coverage/
+*.tsbuildinfo
+
+# Packaged extension artifacts
+*.zip.sha256
 
 # Test output
 playwright-report/
 test-results/
+.nyc_output/
+.vitest/
 
-# Local recordings and planning scratch files
+# Local recordings, screenshots, and planning scratch files
 tmp/
+temp/
 recordings/
+artifacts/
+.debug-logs/
+design-qa.md
 *.bugtrace.zip
+*.tmp
+*.bak
+
+# Cache
+.cache/
+.eslintcache
+.parcel-cache/
+.turbo/
+.vite/
 
 # Environment and editor files
 .env
 .env.*
 !.env.example
 .DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.swp
+*.swo
+*~
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

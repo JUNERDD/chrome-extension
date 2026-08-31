@@ -4,6 +4,7 @@ import {
   SessionTransitionError,
   TabScopeError,
   addDescendantTab,
+  addTopLevelTab,
   createIdleState,
   createTabScope,
   getActiveDurationMs,
@@ -185,6 +186,84 @@ describe('tab scope lineage', () => {
     const child = addDescendantTab(root, 20, 10);
     expect(addDescendantTab(child, 20, 10)).toBe(child);
     expect(() => addDescendantTab(child, 20, 20)).toThrow('different opener');
+  });
+
+  it('adds an independently activated tab as a top-level scope member without changing the original root', () => {
+    const root = createTabScope(10, { windowId: 1, addedAtMs: 100 });
+    const activated = addTopLevelTab(root, {
+      tabId: 20,
+      windowId: 2,
+      addedAtMs: 200,
+    });
+    const descendant = addDescendantTab(activated, {
+      tabId: 21,
+      openerTabId: 20,
+      windowId: 2,
+      addedAtMs: 300,
+    });
+
+    expect(activated.rootTabId).toBe(10);
+    expect(activated.tabs.find((tab) => tab.tabId === 20)).toEqual({
+      tabId: 20,
+      parentTabId: null,
+      windowId: 2,
+      addedAtMs: 200,
+      closedAtMs: null,
+    });
+    expect(getTabLineage(activated, 20)).toEqual([20]);
+    expect(getTabLineage(descendant, 21)).toEqual([20, 21]);
+  });
+
+  it('idempotently enriches top-level tab identity and rejects conflicting lineage', () => {
+    const root = createTabScope(10);
+    const discovered = addTopLevelTab(root, { tabId: 20 });
+    const enriched = addTopLevelTab(discovered, { tabId: 20, windowId: 3 });
+
+    expect(enriched.tabs.find((tab) => tab.tabId === 20)?.windowId).toBe(3);
+    expect(addTopLevelTab(enriched, { tabId: 20, windowId: 3 })).toBe(enriched);
+
+    const descendant = addDescendantTab(root, { tabId: 30, openerTabId: 10 });
+    expect(() => addTopLevelTab(descendant, { tabId: 30 })).toThrow('attributed to opener');
+  });
+
+  it('upgrades a non-root top-level member when its authoritative opener arrives later', () => {
+    const activated = addTopLevelTab(
+      createTabScope(10, { windowId: 1, addedAtMs: 100 }),
+      { tabId: 20, addedAtMs: 200 },
+    );
+    const attributed = addDescendantTab(activated, {
+      tabId: 20,
+      openerTabId: 10,
+      windowId: 2,
+      addedAtMs: 300,
+    });
+
+    expect(attributed.rootTabId).toBe(10);
+    expect(attributed.tabs.find((tab) => tab.tabId === 20)).toEqual({
+      tabId: 20,
+      parentTabId: 10,
+      windowId: 2,
+      addedAtMs: 200,
+      closedAtMs: null,
+    });
+    expect(getTabLineage(attributed, 20)).toEqual([10, 20]);
+  });
+
+  it('does not reparent the starting tab or create a cycle while upgrading lineage', () => {
+    const activated = addTopLevelTab(createTabScope(10), { tabId: 20 });
+    expect(() => addDescendantTab(activated, { tabId: 10, openerTabId: 20 })).toThrow(
+      'starting tab',
+    );
+
+    const withChild = addDescendantTab(activated, { tabId: 21, openerTabId: 20 });
+    expect(() => addDescendantTab(withChild, { tabId: 20, openerTabId: 21 })).toThrow(
+      'descendants',
+    );
+
+    const closed = markTabClosed(activated, 20, 1);
+    expect(() =>
+      addDescendantTab(closed, { tabId: 20, openerTabId: 10, addedAtMs: 1 }),
+    ).toThrow('already closed');
   });
 
   it('enriches a navigation-discovered child with its later tab window identity', () => {

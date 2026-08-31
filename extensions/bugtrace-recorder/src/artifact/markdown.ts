@@ -7,7 +7,6 @@ import type {
   TargetDescriptor,
   UntrustedObservation,
 } from './types';
-import { assertNoSecrets } from './secrets';
 import { assertValidTrace } from './validate';
 
 const DEFAULT_REPORT_LIMIT_BYTES = 100 * 1024;
@@ -155,35 +154,164 @@ function describeStepMetadata(step: SemanticStep): string[] {
   return details;
 }
 
+function recordIdentity(record: {
+  seq: number;
+  sourceSeq?: number;
+  id: string;
+  tabId?: string;
+  frameId?: string;
+}): string {
+  const fields = [
+    `seq=${record.seq}`,
+    ...(record.sourceSeq === undefined ? [] : [`sourceSeq=${record.sourceSeq}`]),
+    `id=${escapeMarkdownText(record.id)}`,
+    ...(record.tabId ? [`tabId=${escapeMarkdownText(record.tabId)}`] : []),
+    ...(record.frameId ? [`frameId=${escapeMarkdownText(record.frameId)}`] : []),
+  ];
+  return `[${fields.join('; ')}]`;
+}
+
 function observedFailures(trace: BugtraceTrace): string[] {
-  const failures: string[] = [];
-  for (const error of [...trace.errors].sort((left, right) => left.seq - right.seq)) {
-    failures.push(
-      `- ${formatOffset(error.offsetMs)} [${escapeMarkdownText(error.kind)}] ${describeObservation(error.message)}`,
-    );
+  const failures: Array<{
+    seq: number;
+    sourceSeq?: number;
+    offsetMs: number;
+    id: string;
+    tabId: string;
+    frameId?: string;
+    kind: string;
+    detail: string;
+  }> = [];
+  for (const error of trace.errors) {
+    failures.push({
+      seq: error.seq,
+      ...(error.sourceSeq === undefined ? {} : { sourceSeq: error.sourceSeq }),
+      offsetMs: error.offsetMs,
+      id: error.id,
+      tabId: error.tabId,
+      ...(error.frameId ? { frameId: error.frameId } : {}),
+      kind: error.kind,
+      detail: describeObservation(error.message),
+    });
   }
-  for (const entry of [...trace.console]
-    .filter((item) => item.level === 'error')
-    .sort((left, right) => left.seq - right.seq)) {
-    failures.push(
-      `- ${formatOffset(entry.offsetMs)} [console error] ${describeObservation(entry.message)}${entry.repeatCount > 1 ? ` (repeated ${entry.repeatCount} times)` : ''}`,
-    );
+  for (const entry of trace.console.filter((item) => item.level === 'error')) {
+    failures.push({
+      seq: entry.seq,
+      ...(entry.sourceSeq === undefined ? {} : { sourceSeq: entry.sourceSeq }),
+      offsetMs: entry.offsetMs,
+      id: entry.id,
+      tabId: entry.tabId,
+      ...(entry.frameId ? { frameId: entry.frameId } : {}),
+      kind: 'console error',
+      detail: `${describeObservation(entry.message)}${entry.repeatCount > 1 ? ` (repeated ${entry.repeatCount} times)` : ''}`,
+    });
   }
-  for (const request of [...trace.network]
-    .filter((item) => item.outcome === 'failed' || (item.statusCode ?? 0) >= 400)
-    .sort((left, right) => left.seq - right.seq)) {
-    failures.push(
-      `- ${formatOffset(request.offsetMs)} [network ${request.statusCode ?? request.outcome}] ${escapeMarkdownText(request.method)} ${escapeMarkdownText(request.url)}`,
-    );
+  for (const request of trace.network.filter(
+    (item) => item.outcome === 'failed' || (item.statusCode ?? 0) >= 400,
+  )) {
+    failures.push({
+      seq: request.seq,
+      ...(request.sourceSeq === undefined ? {} : { sourceSeq: request.sourceSeq }),
+      offsetMs: request.offsetMs,
+      id: request.id,
+      tabId: request.tabId,
+      kind: `network ${request.statusCode ?? request.outcome}`,
+      detail: `${escapeMarkdownText(request.method)} ${escapeMarkdownText(request.url)}${request.error ? ` — ${describeObservation(request.error)}` : ''}`,
+    });
   }
-  for (const navigation of [...trace.navigations]
-    .filter((item) => item.outcome === 'failed')
-    .sort((left, right) => left.seq - right.seq)) {
-    failures.push(
-      `- ${formatOffset(navigation.offsetMs)} [navigation failed] ${escapeMarkdownText(navigation.url)}${navigation.error ? ` — ${describeObservation(navigation.error)}` : ''}`,
-    );
+  for (const navigation of trace.navigations.filter((item) => item.outcome === 'failed')) {
+    failures.push({
+      seq: navigation.seq,
+      ...(navigation.sourceSeq === undefined ? {} : { sourceSeq: navigation.sourceSeq }),
+      offsetMs: navigation.offsetMs,
+      id: navigation.id,
+      tabId: navigation.tabId,
+      ...(navigation.frameId ? { frameId: navigation.frameId } : {}),
+      kind: 'navigation failed',
+      detail: `${escapeMarkdownText(navigation.url)}${navigation.error ? ` — ${describeObservation(navigation.error)}` : ''}`,
+    });
   }
-  return failures;
+  return failures
+    .sort((left, right) =>
+      left.seq - right.seq ||
+      left.offsetMs - right.offsetMs ||
+      left.id.localeCompare(right.id),
+    )
+    .map((failure) =>
+      `- ${formatOffset(failure.offsetMs)} ${recordIdentity(failure)} [${escapeMarkdownText(failure.kind)}] ${failure.detail}`,
+    );
+}
+
+function captureGapLines(trace: BugtraceTrace): string[] {
+  return [...trace.captureGaps]
+    .sort((left, right) =>
+      left.seq - right.seq ||
+      left.offsetMs - right.offsetMs ||
+      left.id.localeCompare(right.id),
+    )
+    .map((gap) => {
+      const details = [
+        `source=${escapeMarkdownText(gap.source)}`,
+        `status=${escapeMarkdownText(gap.status)}`,
+        `reason=${escapeMarkdownText(gap.reason)}`,
+        ...(gap.affectedSources?.length
+          ? [`affectedSources=${gap.affectedSources.map(escapeMarkdownText).join(',')}`]
+          : []),
+        ...(gap.droppedCount === undefined ? [] : [`dropped=${gap.droppedCount}`]),
+        ...(gap.observation ? [describeObservation(gap.observation)] : []),
+      ];
+      return `- ${formatOffset(gap.offsetMs)} ${recordIdentity(gap)} — ${details.join('; ')}`;
+    });
+}
+
+function evidencePathLines(trace: BugtraceTrace): string[] {
+  const lines = [
+    '- Canonical semantic trace: trace.json',
+    '- Human and agent brief: report.md',
+    '- Machine-readable contract: schema/bugtrace-v1.schema.json',
+  ];
+  for (const screenshot of [...trace.screenshots].sort((left, right) => left.seq - right.seq)) {
+    if (screenshot.status === 'present') {
+      lines.push(
+        `- Screenshot ${recordIdentity(screenshot)} — ${escapeMarkdownText(screenshot.path)}; ${escapeMarkdownText(screenshot.mimeType)}; ${screenshot.width}×${screenshot.height}; trigger=${escapeMarkdownText(screenshot.trigger)}`,
+      );
+    } else {
+      lines.push(
+        `- Screenshot ${recordIdentity(screenshot)} — ${escapeMarkdownText(screenshot.status)}; reason=${escapeMarkdownText(screenshot.reason)}`,
+      );
+    }
+  }
+  for (const segment of [...trace.rrweb.segments].sort(
+    (left, right) => left.startSeq - right.startSeq || left.id.localeCompare(right.id),
+  )) {
+    const sourceSeq = segment.sourceStartSeq === undefined || segment.sourceEndSeq === undefined
+      ? ''
+      : `; sourceSeq=${segment.sourceStartSeq}-${segment.sourceEndSeq}`;
+    const identity = `[seq=${segment.startSeq}-${segment.endSeq}${sourceSeq}; id=${escapeMarkdownText(segment.id)}; tabId=${escapeMarkdownText(segment.tabId)}${segment.frameId ? `; frameId=${escapeMarkdownText(segment.frameId)}` : ''}]`;
+    if (segment.status === 'present') {
+      lines.push(
+        `- rrweb segment ${identity} — ${escapeMarkdownText(segment.path)}; events=${segment.eventCount}; dropped=${segment.droppedCount}`,
+      );
+    } else {
+      lines.push(
+        `- rrweb segment ${identity} — ${escapeMarkdownText(segment.status)}; reason=${escapeMarkdownText(segment.reason)}; events=${segment.eventCount}; dropped=${segment.droppedCount}`,
+      );
+    }
+  }
+  for (const attachment of [...trace.attachments].sort((left, right) =>
+    left.id.localeCompare(right.id),
+  )) {
+    if (attachment.status === 'present') {
+      lines.push(
+        `- Attachment [id=${escapeMarkdownText(attachment.id)}] — ${escapeMarkdownText(attachment.path)}; ${escapeMarkdownText(attachment.mimeType)}; ${attachment.size} bytes; purpose=${escapeMarkdownText(attachment.purpose)}`,
+      );
+    } else {
+      lines.push(
+        `- Attachment [id=${escapeMarkdownText(attachment.id)}] — ${escapeMarkdownText(attachment.status)}; reason=${escapeMarkdownText(attachment.reason)}; purpose=${escapeMarkdownText(attachment.purpose)}`,
+      );
+    }
+  }
+  return lines;
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
@@ -232,15 +360,27 @@ export function buildMarkdownReport(
         details.push(describeObservation(step.observation));
       }
       if (step.input) {
-        details.push(
-          `input value ${step.input.status}; type ${escapeMarkdownText(step.input.inputType)}${step.input.lengthBucket ? `; length ${step.input.lengthBucket}` : ''}`,
-        );
+        if (step.input.status === 'redacted') {
+          details.push(
+            `input value redacted; type ${escapeMarkdownText(step.input.inputType)}${step.input.lengthBucket ? `; length ${step.input.lengthBucket}` : ''}`,
+          );
+        } else {
+          const serialized = typeof step.input.value === 'string'
+            ? step.input.value
+            : JSON.stringify(step.input.value);
+          const captured = cropObservation(serialized);
+          details.push(
+            `input value captured; type ${escapeMarkdownText(step.input.inputType)}; Untrusted observation (input): ${escapeMultiline(captured.value)}${captured.truncated ? ' [truncated]' : ''}`,
+          );
+        }
       }
       details.push(...describeStepMetadata(step));
-      return `${index + 1}. ${formatOffset(step.offsetMs)} **${ACTION_LABELS[step.action]}** — ${details.join('; ')}`;
+      return `${index + 1}. ${formatOffset(step.offsetMs)} ${recordIdentity(step)} **${ACTION_LABELS[step.action]}** — ${details.join('; ')}`;
     });
 
   const failures = observedFailures(trace);
+  const gaps = captureGapLines(trace);
+  const evidencePaths = evidencePathLines(trace);
   const environment = [
     trace.environment.browser
       ? `- Browser: ${escapeMarkdownText(trace.environment.browser.name)} ${
@@ -296,17 +436,25 @@ export function buildMarkdownReport(
     '',
     ...environment,
     '',
-    '## Capture coverage and privacy',
+    '## Capture coverage and fidelity',
     '',
     coverageLine('Semantic trace', trace.coverage.semantic),
     coverageLine('rrweb supporting evidence', trace.coverage.rrweb),
     coverageLine('Console', trace.coverage.console),
-    coverageLine('Network metadata', trace.coverage.network),
+    coverageLine('Network evidence', trace.coverage.network),
     coverageLine('Screenshots', trace.coverage.screenshots),
     `- Capture gaps: ${trace.captureGaps.length}`,
-    `- Inputs: ${trace.privacy.inputValues}; URL query values: ${trace.privacy.urlQueryValues}`,
+    `- Capture mode: ${trace.privacy.captureMode}; inputs: ${trace.privacy.inputValues}; URL query values: ${trace.privacy.urlQueryValues}`,
     `- Request/response bodies: ${trace.privacy.requestBodies}/${trace.privacy.responseBodies}; cookies and sensitive headers: ${trace.privacy.cookies}/${trace.privacy.sensitiveHeaders}`,
-    `- Minimum observed redactions: ${trace.privacy.redactionCount}; count semantics: ${trace.privacy.redactionCountSemantics}; local only: ${String(trace.privacy.localOnly)}`,
+    `- Active redactions: ${trace.privacy.redactionCount}; count semantics: ${trace.privacy.redactionCountSemantics}; local only: ${String(trace.privacy.localOnly)}`,
+    '',
+    '## Capture gaps',
+    '',
+    ...(gaps.length ? gaps : ['_No capture gaps were reported\\._']),
+    '',
+    '## Evidence paths',
+    '',
+    ...evidencePaths,
     '',
     '## Attachments',
     '',
@@ -320,9 +468,7 @@ export function buildMarkdownReport(
     '',
   ];
 
-  const report = truncateUtf8(lines.join('\n'), maxBytes);
-  assertNoSecrets(report, 'report.md');
-  return report;
+  return truncateUtf8(lines.join('\n'), maxBytes);
 }
 
 export const renderMarkdown = buildMarkdownReport;

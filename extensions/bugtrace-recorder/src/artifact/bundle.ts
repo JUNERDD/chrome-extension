@@ -1,8 +1,10 @@
 import JSZip from 'jszip';
-
 import { buildMarkdownReport } from './markdown';
 import { BUGTRACE_V1_SCHEMA_JSON } from './schema';
-import { assertNoSecrets, isTextMimeType } from './secrets';
+import {
+  assertArtifactConsistency,
+  validateEvidenceResourceClosure,
+} from './semantic';
 import {
   BUGTRACE_BUNDLE_FORMAT,
   BUGTRACE_BUNDLE_VERSION,
@@ -25,7 +27,11 @@ const SCHEMA_PATH = 'schema/bugtrace-v1.schema.json';
 const RESERVED_PATHS = new Set([MANIFEST_PATH, TRACE_PATH, REPORT_PATH, SCHEMA_PATH]);
 const SAFE_ARCHIVE_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]+$/;
 const SAFE_MIME_TYPE = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/;
+const SAFE_LOGICAL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const MAX_RESOURCE_COUNT = 10_000;
+const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+const MAX_TOTAL_ENTRY_BYTES = 240 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024;
 
 interface PreparedEntry {
   path: string;
@@ -33,6 +39,11 @@ interface PreparedEntry {
   mimeType: string;
   purpose: BundleEntryPurpose;
   relatedId?: string;
+}
+
+interface PreparedResourceEntry extends PreparedEntry {
+  purpose: BundleResourceInput['purpose'];
+  relatedId: string;
 }
 
 interface ZipEntrySize {
@@ -87,6 +98,9 @@ function validateResource(resource: BundleResourceInput): void {
   if (!SAFE_MIME_TYPE.test(resource.mimeType)) {
     throw new TypeError(`Invalid MIME type for ${resource.path}.`);
   }
+  if (!SAFE_LOGICAL_ID.test(resource.relatedId) || resource.relatedId.length > 128) {
+    throw new TypeError(`Invalid related evidence id for ${resource.path}.`);
+  }
 
   const expectedPrefix: Readonly<Record<BundleResourceInput['purpose'], string>> = {
     'rrweb-segment': 'rrweb/',
@@ -106,55 +120,21 @@ function validateResource(resource: BundleResourceInput): void {
   }
 }
 
-async function prepareResource(resource: BundleResourceInput): Promise<PreparedEntry> {
+async function prepareResource(resource: BundleResourceInput): Promise<PreparedResourceEntry> {
   validateResource(resource);
   const bytes = await toBytes(resource.data);
-  if (isTextMimeType(resource.mimeType)) {
-    assertNoSecrets(bytes, resource.path);
+  if (bytes.byteLength > MAX_ENTRY_BYTES) {
+    throw new RangeError(
+      `Bugtrace resource ${resource.path} exceeds the ${MAX_ENTRY_BYTES}-byte limit.`,
+    );
   }
   return {
     path: resource.path,
     bytes,
     mimeType: resource.mimeType,
     purpose: resource.purpose,
-    ...(resource.relatedId === undefined ? {} : { relatedId: resource.relatedId }),
+    relatedId: resource.relatedId,
   };
-}
-
-function requiredEvidencePaths(input: BuildBugtraceZipInput): ReadonlyMap<string, BundleEntryPurpose> {
-  const required = new Map<string, BundleEntryPurpose>();
-  for (const segment of input.trace.rrweb.segments) {
-    if (segment.status === 'present' && segment.path) {
-      required.set(segment.path, 'rrweb-segment');
-    }
-  }
-  for (const screenshot of input.trace.screenshots) {
-    if (screenshot.status === 'present' && screenshot.path) {
-      required.set(screenshot.path, 'screenshot');
-    }
-  }
-  for (const attachment of input.trace.attachments) {
-    if (attachment.status === 'present' && attachment.path) {
-      required.set(attachment.path, 'attachment');
-    }
-  }
-  return required;
-}
-
-function verifyEvidenceResources(
-  input: BuildBugtraceZipInput,
-  resources: readonly PreparedEntry[],
-): void {
-  const resourcesByPath = new Map(resources.map((resource) => [resource.path, resource]));
-  for (const [path, purpose] of requiredEvidencePaths(input)) {
-    const resource = resourcesByPath.get(path);
-    if (!resource) {
-      throw new Error(`Trace declares present evidence without bundle data: ${path}`);
-    }
-    if (resource.purpose !== purpose) {
-      throw new Error(`Trace evidence purpose mismatch for ${path}.`);
-    }
-  }
 }
 
 function createZip(
@@ -281,9 +261,6 @@ export async function buildBugtraceZip(input: BuildBugtraceZipInput): Promise<Bu
 
   const traceJson = `${JSON.stringify(input.trace, null, 2)}\n`;
   const report = buildMarkdownReport(input.trace, input.report);
-  assertNoSecrets(traceJson, TRACE_PATH);
-  assertNoSecrets(report, REPORT_PATH);
-  assertNoSecrets(BUGTRACE_V1_SCHEMA_JSON, SCHEMA_PATH);
 
   const coreEntries: PreparedEntry[] = [
     {
@@ -311,8 +288,20 @@ export async function buildBugtraceZip(input: BuildBugtraceZipInput): Promise<Bu
       .map(prepareResource),
   );
   const entries = [...coreEntries, ...resources];
+  const oversizedEntry = entries.find((entry) => entry.bytes.byteLength > MAX_ENTRY_BYTES);
+  if (oversizedEntry) {
+    throw new RangeError(
+      `Bugtrace entry ${oversizedEntry.path} exceeds the ${MAX_ENTRY_BYTES}-byte limit.`,
+    );
+  }
+  const totalEntryBytes = entries.reduce((sum, entry) => sum + entry.bytes.byteLength, 0);
+  if (totalEntryBytes > MAX_TOTAL_ENTRY_BYTES) {
+    throw new RangeError(
+      `Bugtrace entries exceed the ${MAX_TOTAL_ENTRY_BYTES}-byte aggregate limit.`,
+    );
+  }
   validateUniquePaths(entries);
-  verifyEvidenceResources(input, resources);
+  assertArtifactConsistency(validateEvidenceResourceClosure(input.trace, resources));
 
   const createdAt = input.createdAt ?? input.trace.session.endedAt;
   const createdAtDate = new Date(createdAt);
@@ -333,9 +322,11 @@ export async function buildBugtraceZip(input: BuildBugtraceZipInput): Promise<Bu
     entries: await createManifestEntries(entries, sizes),
   };
   const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
-  assertNoSecrets(manifestJson, MANIFEST_PATH);
 
   const bytes = await generateZip(entries, zipDate, compressionLevel, manifestJson);
+  if (bytes.byteLength > MAX_ARCHIVE_BYTES) {
+    throw new RangeError(`Bugtrace ZIP exceeds the ${MAX_ARCHIVE_BYTES}-byte archive limit.`);
+  }
   const finalSizes = readZipEntrySizes(bytes);
   for (const entry of manifest.entries) {
     const finalSize = finalSizes.get(entry.path);

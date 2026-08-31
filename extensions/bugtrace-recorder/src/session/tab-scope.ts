@@ -25,6 +25,10 @@ export interface DescendantTabInput extends TabScopeOptions {
   readonly openerTabId: number;
 }
 
+export interface TopLevelTabInput extends TabScopeOptions {
+  readonly tabId: number;
+}
+
 export interface ReplacementTabInput extends TabScopeOptions {
   readonly removedTabId: number;
   readonly addedTabId: number;
@@ -95,6 +99,55 @@ export function isOpenTabInScope(scope: SessionTabScope | null, tabId: number): 
   return scope !== null && getScopedTab(scope, tabId)?.closedAtMs === null;
 }
 
+/** Adds an independently activated capture tab without attributing a false opener. */
+export function addTopLevelTab(
+  scope: SessionTabScope,
+  input: TopLevelTabInput,
+): SessionTabScope {
+  assertTabId(input.tabId, 'tabId');
+  const addedAtMs = input.addedAtMs ?? 0;
+  assertTimestamp(addedAtMs, 'addedAtMs');
+
+  const existing = getScopedTab(scope, input.tabId);
+  if (existing !== null) {
+    if (existing.closedAtMs !== null) {
+      throw new TabScopeError(
+        'tab_already_closed',
+        `Tab ${input.tabId} was already closed and cannot be re-added ambiguously.`,
+      );
+    }
+    if (existing.parentTabId !== null) {
+      throw new TabScopeError(
+        'tab_parent_conflict',
+        `Tab ${input.tabId} is already attributed to opener ${existing.parentTabId}.`,
+      );
+    }
+    if (existing.windowId === null && input.windowId !== null && input.windowId !== undefined) {
+      return {
+        ...scope,
+        tabs: scope.tabs.map((tab) =>
+          tab.tabId === input.tabId ? { ...tab, windowId: input.windowId ?? null } : tab,
+        ),
+      };
+    }
+    return scope;
+  }
+
+  return {
+    ...scope,
+    tabs: [
+      ...scope.tabs,
+      {
+        tabId: input.tabId,
+        parentTabId: null,
+        windowId: input.windowId ?? null,
+        addedAtMs,
+        closedAtMs: null,
+      },
+    ],
+  };
+}
+
 export function addDescendantTab(
   scope: SessionTabScope,
   input: DescendantTabInput,
@@ -158,9 +211,31 @@ export function addDescendantTab(
       }
       return scope;
     }
+    if (existing.parentTabId === null && existing.tabId !== scope.rootTabId) {
+      if (getTabLineage(scope, input.openerTabId).includes(existing.tabId)) {
+        throw new TabScopeError(
+          'tab_parent_conflict',
+          `Tab ${input.tabId} cannot be attributed to one of its descendants.`,
+        );
+      }
+      return {
+        ...scope,
+        tabs: scope.tabs.map((tab) =>
+          tab.tabId === input.tabId
+            ? {
+                ...tab,
+                parentTabId: input.openerTabId,
+                windowId: tab.windowId ?? input.windowId ?? null,
+              }
+            : tab,
+        ),
+      };
+    }
     throw new TabScopeError(
       'tab_parent_conflict',
-      `Tab ${input.tabId} is already attributed to a different opener.`,
+      existing.tabId === scope.rootTabId
+        ? `The starting tab ${input.tabId} cannot be attributed to an opener.`
+        : `Tab ${input.tabId} is already attributed to a different opener.`,
     );
   }
 
@@ -270,7 +345,7 @@ export function replaceScopedTab(
   };
 }
 
-/** Returns root-to-leaf lineage, or an empty array when the tab is out of scope. */
+/** Returns top-level-to-leaf lineage, or an empty array when the tab is out of scope. */
 export function getTabLineage(scope: SessionTabScope, tabId: number): readonly number[] {
   const lineage: number[] = [];
   const visited = new Set<number>();
@@ -283,7 +358,7 @@ export function getTabLineage(scope: SessionTabScope, tabId: number): readonly n
       current.parentTabId === null ? null : getScopedTab(scope, current.parentTabId);
   }
   lineage.reverse();
-  return lineage[0] === scope.rootTabId ? lineage : [];
+  return lineage;
 }
 
 export function isSupportedCaptureUrl(url: string): boolean {

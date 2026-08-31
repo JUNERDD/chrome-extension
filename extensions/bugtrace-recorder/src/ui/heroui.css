@@ -1,0 +1,16 @@
+@import '@heroui/styles';
+
+:root {
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  min-width: 320px;
+}

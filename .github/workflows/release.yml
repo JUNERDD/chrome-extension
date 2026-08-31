@@ -1,0 +1,228 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'bugtrace-recorder-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Validate and Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CI: 'true'
+    outputs:
+      display-name: ${{ steps.target.outputs.display-name }}
+      extension: ${{ steps.target.outputs.extension }}
+      previous-tag: ${{ steps.target.outputs.previous-tag }}
+      version: ${{ steps.target.outputs.version }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve and validate release target
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF_NAME" != bugtrace-recorder-v* ]]; then
+            echo "::error::Unsupported release tag ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+
+          extension="bugtrace-recorder"
+          display_name="Bugtrace Recorder"
+          version="${GITHUB_REF_NAME#bugtrace-recorder-v}"
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} does not contain a valid semantic version."
+            exit 1
+          fi
+
+          package_version="$(node -p "require('./extensions/${extension}/package.json').version")"
+          if [[ "$package_version" != "$version" ]]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} does not match ${extension} version ${package_version}."
+            exit 1
+          fi
+
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit reachable from main."
+            exit 1
+          fi
+
+          previous_tag=""
+          while IFS= read -r candidate_tag; do
+            if [[ "$candidate_tag" != "$GITHUB_REF_NAME" ]] && \
+              git merge-base --is-ancestor "$candidate_tag" "$GITHUB_SHA"; then
+              previous_tag="$candidate_tag"
+              break
+            fi
+          done < <(git tag --list "${extension}-v*" --sort=-version:refname)
+
+          echo "display-name=${display_name}" >> "$GITHUB_OUTPUT"
+          echo "extension=${extension}" >> "$GITHUB_OUTPUT"
+          echo "previous-tag=${previous_tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run quality gate
+        run: pnpm check
+
+      - name: Audit dependencies
+        run: pnpm audit:dependencies
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter @juner/bugtrace-recorder exec playwright install --with-deps chromium
+
+      - name: Extension E2E and manifest audit
+        run: pnpm --filter @juner/bugtrace-recorder test:e2e
+
+      - name: Package release target
+        run: pnpm package:zip
+
+      - name: Verify release package
+        run: pnpm verify:zip
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.target.outputs.extension }}-${{ steps.target.outputs.version }}
+          path: |
+            extensions/bugtrace-recorder/.output/bugtrace-recorder-${{ steps.target.outputs.version }}-chrome.zip
+            extensions/bugtrace-recorder/.output/bugtrace-recorder-${{ steps.target.outputs.version }}-chrome.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.build.outputs.extension }}-${{ needs.build.outputs.version }}
+          path: artifacts
+
+      - name: Verify checksum
+        env:
+          EXTENSION_NAME: ${{ needs.build.outputs.extension }}
+          VERSION: ${{ needs.build.outputs.version }}
+        working-directory: artifacts
+        run: sha256sum --check "${EXTENSION_NAME}-${VERSION}-chrome.zip.sha256"
+
+      - name: Publish immutable release assets
+        env:
+          DISPLAY_NAME: ${{ needs.build.outputs.display-name }}
+          EXTENSION_NAME: ${{ needs.build.outputs.extension }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ needs.build.outputs.previous-tag }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package="artifacts/${EXTENSION_NAME}-${VERSION}-chrome.zip"
+          checksum="${package}.sha256"
+          expected_prerelease=false
+          if [[ "$VERSION" == *-* ]]; then
+            expected_prerelease=true
+          fi
+
+          release_is_draft=""
+          if release_is_draft="$(gh release view "$TAG_NAME" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            release_name="$(gh release view "$TAG_NAME" --json name --jq '.name')"
+            release_is_prerelease="$(gh release view "$TAG_NAME" --json isPrerelease --jq '.isPrerelease')"
+            if [[ "$release_name" != "${DISPLAY_NAME} v${VERSION}" ]] || \
+              [[ "$release_is_prerelease" != "$expected_prerelease" ]]; then
+              echo "::error::Existing release metadata does not match ${TAG_NAME}."
+              exit 1
+            fi
+          else
+            create_args=(
+              "$TAG_NAME"
+              --draft
+              --verify-tag
+              --title "${DISPLAY_NAME} v${VERSION}"
+            )
+            if [[ "$expected_prerelease" == true ]]; then
+              create_args+=(--prerelease)
+            fi
+            if [[ -n "$PREVIOUS_TAG" ]]; then
+              create_args+=(--generate-notes --notes-start-tag "$PREVIOUS_TAG")
+            else
+              release_notes="$(mktemp)"
+              printf '%s\n' \
+                "First public MIT release of Bugtrace Recorder." \
+                "" \
+                "### Highlights" \
+                "" \
+                "- Side Panel workbench replaces the toolbar popup." \
+                "- English and Simplified Chinese UI, with a full-page options surface." \
+                "- Sandboxed rrweb replay and an offline ZIP verifier." \
+                "- Load-unpacked Chrome zip plus SHA-256 checksum on GitHub Releases." \
+                "" \
+                "Recorded sessions and exported \`.bugtrace.zip\` files can contain secrets. Use the extension only in environments you trust." \
+                > "$release_notes"
+              create_args+=(--notes-file "$release_notes")
+            fi
+            gh release create "${create_args[@]}"
+            release_is_draft=true
+          fi
+
+          existing_assets="$(gh release view "$TAG_NAME" --json assets --jq '.assets[].name')"
+          download_dir="$(mktemp -d)"
+          for asset in "$package" "$checksum"; do
+            asset_name="$(basename "$asset")"
+            if grep -Fxq "$asset_name" <<< "$existing_assets"; then
+              gh release download "$TAG_NAME" --pattern "$asset_name" --dir "$download_dir"
+              if ! cmp --silent "$asset" "$download_dir/$asset_name"; then
+                echo "::error::Release asset ${asset_name} already exists with different content."
+                exit 1
+              fi
+              continue
+            fi
+
+            if [[ "$release_is_draft" != true ]]; then
+              echo "::error::Published release ${TAG_NAME} is missing immutable asset ${asset_name}."
+              exit 1
+            fi
+            gh release upload "$TAG_NAME" "$asset"
+          done
+
+          if [[ "$release_is_draft" == true ]]; then
+            gh release edit "$TAG_NAME" --draft=false
+          fi

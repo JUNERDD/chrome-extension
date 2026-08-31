@@ -6,7 +6,6 @@ import {
   BUGTRACE_V1_SCHEMA_JSON,
   BUGTRACE_V1_SCHEMA_URL,
   BUGTRACE_V1_VALIDATOR_SCHEMA_SHA256,
-  SecretLeakError,
   assertNoSecrets,
   buildBugtraceZip,
   buildMarkdownReport,
@@ -20,7 +19,7 @@ import {
 function makeTrace(): BugtraceTrace {
   return {
     format: 'bugtrace',
-    formatVersion: '1.0.0',
+    formatVersion: '1.1.0',
     generator: {
       name: 'Bugtrace Recorder',
       version: '0.1.0',
@@ -42,6 +41,7 @@ function makeTrace(): BugtraceTrace {
     },
     privacy: {
       localOnly: true,
+      captureMode: 'privacy-filtered',
       inputValues: 'redacted',
       urlQueryValues: 'redacted',
       requestBodies: 'omitted',
@@ -197,7 +197,7 @@ function makeTrace(): BugtraceTrace {
           endedAtOffsetMs: 1500,
           status: 'present',
           path: 'rrweb/segment-0001.json',
-          eventCount: 10,
+          eventCount: 2,
           droppedCount: 1,
         },
       ],
@@ -325,7 +325,7 @@ describe('Bugtrace v1 schema validation', () => {
     expect(report).toContain('scroll position x=-48, y=320');
     expect(report).toContain('dropped files image/png (1234 bytes), application/octet\\-stream');
     expect(report).toContain('[navigation failed]');
-    expect(report).toContain('Minimum observed redactions: 4');
+    expect(report).toContain('Active redactions: 4');
     expect(report).not.toContain('Redactions applied:');
 
     const invalid = structuredClone(trace) as unknown as { steps: Array<Record<string, unknown>> };
@@ -354,85 +354,102 @@ describe('agent-safe Markdown', () => {
     expect(report).toContain('semantic steps in `trace.json` are normative');
   });
 
+  it('exposes stable record identities, evidence paths, and explicit capture gaps', () => {
+    const report = buildMarkdownReport(makeTrace());
+
+    expect(report).toContain('seq=1; id=step\\-1; tabId=tab\\-1');
+    expect(report).toContain('## Capture gaps');
+    expect(report).toContain('seq=8; id=gap\\-1');
+    expect(report).toContain('source=rrweb; status=truncated');
+    expect(report).toContain('## Evidence paths');
+    expect(report).toContain('Canonical semantic trace: trace.json');
+    expect(report).toContain('screenshots/shot\\-0001\\.png');
+    expect(report).toContain('rrweb/segment\\-0001\\.json');
+    expect(report).toContain(
+      'Attachment [id=attachment\\-1] — attachments/context\\.json',
+    );
+  });
+
+  it('orders failures from every evidence family by the global sequence', () => {
+    const trace = makeTrace();
+    trace.navigations[0] = {
+      ...trace.navigations[0]!,
+      phase: 'failed',
+      outcome: 'failed',
+      error: {
+        status: 'present',
+        trust: 'untrusted_observation',
+        value: 'navigation failed',
+      },
+    };
+
+    const report = buildMarkdownReport(trace);
+    const navigationIndex = report.indexOf('[navigation failed]');
+    const consoleIndex = report.indexOf('[console error]');
+    const networkIndex = report.indexOf('[network 500]');
+    const runtimeIndex = report.indexOf('[unhandled\\_rejection]');
+
+    expect(navigationIndex).toBeGreaterThan(-1);
+    expect(consoleIndex).toBeGreaterThan(navigationIndex);
+    expect(networkIndex).toBeGreaterThan(consoleIndex);
+    expect(runtimeIndex).toBeGreaterThan(networkIndex);
+  });
+
+  it('renders captured input content as bounded untrusted evidence without redacting it', () => {
+    const trace = makeTrace();
+    trace.privacy = {
+      ...trace.privacy,
+      captureMode: 'full-fidelity',
+      inputValues: 'captured',
+      urlQueryValues: 'captured',
+      requestBodies: 'unavailable',
+      responseBodies: 'unavailable',
+      cookies: 'unavailable',
+      sensitiveHeaders: 'unavailable',
+      redactionCount: 0,
+    };
+    trace.screenshots[0]!.redactionCount = 0;
+    trace.steps[0]!.input = {
+      status: 'captured',
+      inputType: 'text',
+      value: { note: 'visible customer note' },
+    };
+
+    const report = buildMarkdownReport(trace);
+
+    expect(report).toContain('input value captured; type text');
+    expect(report).toContain(
+      'Untrusted observation (input): \\{&quot;note&quot;:&quot;visible customer note&quot;\\}',
+    );
+  });
+
   it('removes Markdown structure, HTML and bidirectional controls', () => {
     const escaped = escapeMarkdownText('> # [x](url) <b>ok</b>\u202e');
 
     expect(escaped).toBe('&gt; \\# \\[x\\]\\(url\\) &lt;b&gt;ok&lt;/b&gt;�');
   });
 
-  it('blocks sensitive data when Markdown is generated without a ZIP', () => {
-    expect(() =>
-      buildMarkdownReport(makeTrace(), { notes: 'Authorization: Bearer abcdefghijklmnop' }),
-    ).toThrow(SecretLeakError);
+  it('preserves captured content in standalone Markdown', () => {
+    const report = buildMarkdownReport(makeTrace(), {
+      notes: 'Authorization: Bearer abcdefghijklmnop',
+    });
+
+    expect(report).toContain('Authorization: Bearer abcdefghijklmnop');
   });
 });
 
-describe('export-time secret scanner', () => {
-  it('allows explicit redaction markers', () => {
-    const safe = JSON.stringify(makeTrace());
+describe('legacy export-time secret scanner API', () => {
+  it('is an explicit compatibility no-op for full-fidelity internal artifacts', () => {
+    const raw = [
+      'Authorization: Bearer abcdefghijklmnop',
+      'Cookie: session=topsecretvalue',
+      'password=correct-horse-battery-staple',
+      'https://example.test/path?token=topsecretvalue#private',
+      'card 4242 4242 4242 4242',
+    ].join('\n');
 
-    expect(scanForSecrets(safe, 'trace.json')).toEqual([]);
-    expect(scanForSecrets('# Bug reproduction\n\n## Expected\nWhat should happen?', 'report.md')).toEqual([]);
-    expect(scanForSecrets('{"strategy":"css","value":"#password"}', 'trace.json')).toEqual([]);
-    expect(
-      scanForSecrets(
-        '{"startedAt":"2026-08-17T08:00:00.000Z","timestamp":1786953600000}',
-        'timestamps.json',
-      ),
-    ).toEqual([]);
-    expect(() => assertNoSecrets('https://example.test/?q=%3Credacted%3E')).not.toThrow();
-    expect(
-      scanForSecrets('{"segmentId":"<secret:3660034956000001>"}', 'rrweb-alias.json'),
-    ).toEqual([]);
-    expect(
-      scanForSecrets(
-        'Markdown schema/bugtrace-v1.schema.json and CSS locator main > form.login > input#account',
-        'safe-locators.md',
-      ),
-    ).toEqual([]);
-  });
-
-  it.each([
-    ['authorization-header', 'Authorization: Bearer abcdefghijklmnop'],
-    ['cookie-header', 'Cookie: session=topsecretvalue'],
-    ['credential-field', 'password=correct-horse-battery-staple'],
-    ['credential-field', 'token=topsecretvalue'],
-    ['credential-field', 'token=<topsecretvalue>'],
-    ['credential-field', 'requestBody: SUPER_SECRET_BODY'],
-    ['url-query-value', 'https://example.test/path?token=topsecretvalue'],
-    ['url-query-value', 'next="/path?q=alice"'],
-    ['url-query-value', 'asset=//cdn.example.test/image?user=bob'],
-    ['url-query-value', "fetch('./api?q=carol')"],
-    ['url-query-value', 'GET ../api?q=dave'],
-    ['url-query-value', 'url=?q=erin'],
-    ['url-query-value', 'GET api.example.test/search?q=alice#private'],
-    ['url-query-value', 'url=www.example.test/?user=bob'],
-    ['url-query-value', 'css=url(images/avatar.png?user=carol#x)'],
-    ['url-query-value', 'GET api/v1?q=dave'],
-    ['url-query-value', 'src=avatar.png?u=erin'],
-    ['url-high-entropy-segment', 'GET x.co/a/AbCdEf1234567890GhIj'],
-    ['url-fragment', 'https://example.test/path#topsecretvalue'],
-    ['url-email-segment', 'https://example.test/users/alice%40example.test/profile'],
-    [
-      'url-identifier-segment',
-      'https://example.test/orders/550e8400-e29b-41d4-a716-446655440000',
-    ],
-    ['jwt', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcdefghijklmnopqrstuvwxyz'],
-    ['payment-card', 'card 4242 4242 4242 4242'],
-    ['payment-card', 'card 4242\u00a04242\u22124242\u20094242'],
-    ['payment-card', 'legacy visa 4222222222222'],
-    ['payment-card', 'diners 30569309025904'],
-  ] as const)('detects %s without returning the secret', (kind, secret) => {
-    const findings = scanForSecrets(secret, 'fixture');
-
-    expect(findings.some((finding) => finding.kind === kind)).toBe(true);
-    expect(() => assertNoSecrets(secret, 'fixture')).toThrow(SecretLeakError);
-    try {
-      assertNoSecrets(secret, 'fixture');
-    } catch (error) {
-      expect(String(error)).not.toContain('topsecretvalue');
-      expect(String(error)).not.toContain('correct-horse-battery-staple');
-    }
+    expect(scanForSecrets(raw, 'fixture')).toEqual([]);
+    expect(() => assertNoSecrets(raw, 'fixture')).not.toThrow();
   });
 });
 
@@ -501,37 +518,46 @@ describe('Bugtrace ZIP bundle', () => {
     expect(await zip.file('report.md')?.async('string')).toBe(result.report);
   });
 
-  it('refuses missing declared evidence and leaked secrets', async () => {
+  it('refuses missing declared evidence but preserves raw secrets and rrweb data', async () => {
     await expect(buildBugtraceZip({ trace: makeTrace() })).rejects.toThrow(
-      'Trace declares present evidence',
+      'Present evidence has no bundle resource',
     );
 
     const trace = makeTrace();
     trace.tabs[0]!.initialUrl = 'https://example.test/?auth=raw-secret-value';
-    await expect(
-      buildBugtraceZip({
-        trace,
-        resources: [
-          {
-            path: 'rrweb/segment-0001.json',
-            data: '[]',
-            mimeType: 'application/json',
-            purpose: 'rrweb-segment',
-          },
-          {
-            path: 'screenshots/shot-0001.png',
-            data: new Uint8Array([1]),
-            mimeType: 'image/png',
-            purpose: 'screenshot',
-          },
-          {
-            path: 'attachments/context.json',
-            data: '{}',
-            mimeType: 'application/json',
-            purpose: 'attachment',
-          },
-        ],
-      }),
-    ).rejects.toThrow(SecretLeakError);
+    const rawRrweb = JSON.stringify([
+      { type: 4, timestamp: 1, data: { authorization: 'Bearer raw-secret-value' } },
+      { type: 2, timestamp: 2 },
+    ]);
+    const result = await buildBugtraceZip({
+      trace,
+      resources: [
+        {
+          path: 'rrweb/segment-0001.json',
+          data: rawRrweb,
+          mimeType: 'application/json',
+          purpose: 'rrweb-segment',
+          relatedId: 'segment-1',
+        },
+        {
+          path: 'screenshots/shot-0001.png',
+          data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+          mimeType: 'image/png',
+          purpose: 'screenshot',
+          relatedId: 'shot-1',
+        },
+        {
+          path: 'attachments/context.json',
+          data: '{"source":"tester"}\n',
+          mimeType: 'application/json',
+          purpose: 'attachment',
+          relatedId: 'attachment-1',
+        },
+      ],
+    });
+    const zip = await JSZip.loadAsync(result.bytes);
+
+    expect(await zip.file('rrweb/segment-0001.json')?.async('string')).toBe(rawRrweb);
+    expect(await zip.file('trace.json')?.async('string')).toContain('raw-secret-value');
   });
 });

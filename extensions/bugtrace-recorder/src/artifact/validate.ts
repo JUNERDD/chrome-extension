@@ -1,6 +1,7 @@
 import type { ErrorObject } from 'ajv';
 
 import validateBugtraceV1, { schemaSha256 } from './bugtrace-v1.validator.js';
+import { validateTraceSemantics } from './semantic';
 import type { BugtraceTrace } from './types';
 
 export interface TraceValidationIssue {
@@ -41,7 +42,15 @@ function normalizeErrors(errors: ErrorObject[] | null | undefined): TraceValidat
 
 export function validateTrace(input: unknown): TraceValidationResult {
   if (validateBugtraceV1(input)) {
-    return { valid: true, trace: input, errors: [] };
+    const trace = input as BugtraceTrace;
+    const semanticErrors = validateTraceSemantics(trace).map((issue) => ({
+      ...issue,
+      schemaPath: '#/x-bugtrace-semantic',
+    }));
+    if (semanticErrors.length > 0) {
+      return { valid: false, errors: semanticErrors };
+    }
+    return { valid: true, trace, errors: [] };
   }
   return { valid: false, errors: normalizeErrors(validateBugtraceV1.errors) };
 }
